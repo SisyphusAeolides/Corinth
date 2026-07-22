@@ -257,11 +257,24 @@ impl TopoSorter {
         edges: &[[u16; 16]; MAX_BUILD_JOBS],
         edge_lens: &[u8; MAX_BUILD_JOBS],
     ) -> bool {
+        if n > MAX_BUILD_JOBS {
+            return false;
+        }
+        self.in_degree.fill(0);
+        self.order.fill(0);
+        self.order_len = 0;
+
         // Build in-degree
         for i in 0..n {
+            if usize::from(edge_lens[i]) > edges[i].len() {
+                return false;
+            }
             for j in 0..edge_lens[i] as usize {
                 let dep = edges[i][j] as usize;
-                if dep < n { self.in_degree[dep] = self.in_degree[dep].saturating_add(1); }
+                if dep >= n {
+                    return false;
+                }
+                self.in_degree[i] = self.in_degree[i].saturating_add(1);
             }
         }
 
