@@ -25,7 +25,9 @@ impl HyperVector {
 
     /// Bundle (superpose) multiple hypervectors — holographic union
     pub fn bundle(vectors: &[Self]) -> Self {
-        if vectors.is_empty() { return Self([0i8; D]); }
+        if vectors.is_empty() {
+            return Self([0i8; D]);
+        }
         let mut sum = [0i32; D];
         for v in vectors {
             for (s, &x) in sum.iter_mut().zip(v.0.iter()) {
@@ -50,7 +52,12 @@ impl HyperVector {
 
     /// Cosine similarity ∈ [-1, 1]
     pub fn similarity(&self, other: &Self) -> f32 {
-        let dot: i32 = self.0.iter().zip(other.0.iter()).map(|(&a, &b)| a as i32 * b as i32).sum();
+        let dot: i32 = self
+            .0
+            .iter()
+            .zip(other.0.iter())
+            .map(|(&a, &b)| a as i32 * b as i32)
+            .sum();
         dot as f32 / D as f32 // both are unit hypervectors by construction
     }
 }
@@ -63,7 +70,10 @@ pub struct HolographicShell {
 
 impl HolographicShell {
     pub fn new() -> Self {
-        Self { history: alloc::vec::Vec::new(), context: HyperVector([1i8; D]) }
+        Self {
+            history: alloc::vec::Vec::new(),
+            context: HyperVector([1i8; D]),
+        }
     }
 
     /// Record a completed command into holographic memory
@@ -79,9 +89,13 @@ impl HolographicShell {
     /// Autocomplete: find history entry most similar to partial input
     pub fn recall(&self, partial: &str) -> Option<&str> {
         let query = HyperVector::encode(partial.as_bytes());
-        self.history.iter()
+        self.history
+            .iter()
             .max_by(|(a, _), (b, _)| {
-                query.similarity(a).partial_cmp(&query.similarity(b)).unwrap()
+                query
+                    .similarity(a)
+                    .partial_cmp(&query.similarity(b))
+                    .unwrap()
             })
             .map(|(_, cmd)| cmd.as_str())
     }
@@ -95,9 +109,13 @@ impl HolographicShell {
         // HDC analogy: target = p * b * a  (since a * b encodes the relationship)
         let relationship = a.bind(&b);
         let target = p.bind(&relationship);
-        self.history.iter()
+        self.history
+            .iter()
             .max_by(|(va, _), (vb, _)| {
-                target.similarity(va).partial_cmp(&target.similarity(vb)).unwrap()
+                target
+                    .similarity(va)
+                    .partial_cmp(&target.similarity(vb))
+                    .unwrap()
             })
             .map(|(_, cmd)| cmd.as_str())
     }

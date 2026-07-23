@@ -26,12 +26,12 @@
 
 use crate::dna::OptimizationFocus;
 
-pub const MAX_WORKERS:    usize = 8;
+pub const MAX_WORKERS: usize = 8;
 pub const QUEUE_CAPACITY: usize = 256;
 pub const MAX_BUILD_JOBS: usize = 256;
-pub const LOCAL_DEQUE:    usize = 16;
-pub const THROTTLE_TEMP:  u8    = 85;  // °C: start reducing workers
-pub const CRITICAL_TEMP:  u8    = 95;  // °C: emergency single-worker mode
+pub const LOCAL_DEQUE: usize = 16;
+pub const THROTTLE_TEMP: u8 = 85; // °C: start reducing workers
+pub const CRITICAL_TEMP: u8 = 95; // °C: emergency single-worker mode
 
 // ─────────────────────────────────────────────
 // BUILD JOB
@@ -39,14 +39,14 @@ pub const CRITICAL_TEMP:  u8    = 95;  // °C: emergency single-worker mode
 
 #[derive(Clone, Copy, Debug)]
 pub struct BuildJob {
-    pub pkg_var:        u16,         // variable ID from Alchemist registry
-    pub name_hash:      u64,
-    pub version_idx:    u16,
-    pub focus:          OptimizationFocus,
-    pub ir_offset:      u32,         // offset into shared IR arena
-    pub ir_len:         u32,
-    pub dep_count:      u8,          // number of unsatisfied dependencies
-    pub priority:       i32,         // higher = build sooner
+    pub pkg_var: u16, // variable ID from Alchemist registry
+    pub name_hash: u64,
+    pub version_idx: u16,
+    pub focus: OptimizationFocus,
+    pub ir_offset: u32, // offset into shared IR arena
+    pub ir_len: u32,
+    pub dep_count: u8, // number of unsatisfied dependencies
+    pub priority: i32, // higher = build sooner
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,24 +71,36 @@ pub enum BuildFailure {
 // ─────────────────────────────────────────────
 
 pub struct WorkQueue {
-    pub jobs:  [BuildJob; QUEUE_CAPACITY],
-    pub head:  usize,   // consumer reads from head
-    pub tail:  usize,   // producer writes to tail
+    pub jobs: [BuildJob; QUEUE_CAPACITY],
+    pub head: usize, // consumer reads from head
+    pub tail: usize, // producer writes to tail
     pub count: usize,
 }
 
 impl WorkQueue {
     pub const fn new() -> Self {
         const EMPTY: BuildJob = BuildJob {
-            pkg_var: 0, name_hash: 0, version_idx: 0,
+            pkg_var: 0,
+            name_hash: 0,
+            version_idx: 0,
             focus: OptimizationFocus::MaximumThroughput,
-            ir_offset: 0, ir_len: 0, dep_count: 0, priority: 0,
+            ir_offset: 0,
+            ir_len: 0,
+            dep_count: 0,
+            priority: 0,
         };
-        Self { jobs: [EMPTY; QUEUE_CAPACITY], head: 0, tail: 0, count: 0 }
+        Self {
+            jobs: [EMPTY; QUEUE_CAPACITY],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
     }
 
     pub fn push(&mut self, job: BuildJob) -> bool {
-        if self.count >= QUEUE_CAPACITY { return false; }
+        if self.count >= QUEUE_CAPACITY {
+            return false;
+        }
         self.jobs[self.tail % QUEUE_CAPACITY] = job;
         self.tail += 1;
         self.count += 1;
@@ -96,7 +108,9 @@ impl WorkQueue {
     }
 
     pub fn pop(&mut self) -> Option<BuildJob> {
-        if self.count == 0 { return None; }
+        if self.count == 0 {
+            return None;
+        }
         let job = self.jobs[self.head % QUEUE_CAPACITY];
         self.head += 1;
         self.count -= 1;
@@ -105,7 +119,9 @@ impl WorkQueue {
 
     /// Pop highest-priority job (O(N) scan — queue is small)
     pub fn pop_priority(&mut self) -> Option<BuildJob> {
-        if self.count == 0 { return None; }
+        if self.count == 0 {
+            return None;
+        }
         let mut best_prio = i32::MIN;
         let mut best_slot = 0usize;
         for i in 0..self.count {
@@ -129,12 +145,12 @@ impl WorkQueue {
 // ─────────────────────────────────────────────
 
 pub struct ThermalGovernor {
-    pub readings:        [u8; MAX_WORKERS],
-    pub active_workers:  usize,
-    pub override_focus:  Option<OptimizationFocus>,
+    pub readings: [u8; MAX_WORKERS],
+    pub active_workers: usize,
+    pub override_focus: Option<OptimizationFocus>,
     pub throttle_events: u32,
-    pub emergency_events:u32,
-    pub current_peak:    u8,
+    pub emergency_events: u32,
+    pub current_peak: u8,
 }
 
 impl ThermalGovernor {
@@ -150,7 +166,9 @@ impl ThermalGovernor {
     }
 
     pub fn update(&mut self, worker_id: usize, temp_c: u8) {
-        if worker_id < MAX_WORKERS { self.readings[worker_id] = temp_c; }
+        if worker_id < MAX_WORKERS {
+            self.readings[worker_id] = temp_c;
+        }
         self.current_peak = *self.readings.iter().max().unwrap_or(&0);
         self.govern();
     }
@@ -166,7 +184,9 @@ impl ThermalGovernor {
         } else if self.current_peak >= THROTTLE_TEMP {
             // Throttle: halve workers, switch focus
             let new_w = (self.active_workers / 2).max(1);
-            if new_w < self.active_workers { self.throttle_events += 1; }
+            if new_w < self.active_workers {
+                self.throttle_events += 1;
+            }
             self.active_workers = new_w;
             self.override_focus = Some(OptimizationFocus::ThermalEfficiency);
         } else {
@@ -185,42 +205,50 @@ impl ThermalGovernor {
 // ─────────────────────────────────────────────
 
 pub struct WorkerSlot {
-    pub id:           u8,
-    pub active:       bool,
-    pub local_deque:  [Option<BuildJob>; LOCAL_DEQUE],
-    pub deque_len:    usize,
-    pub jobs_done:    u32,
-    pub jobs_stolen:  u32,
-    pub last_temp:    u8,
+    pub id: u8,
+    pub active: bool,
+    pub local_deque: [Option<BuildJob>; LOCAL_DEQUE],
+    pub deque_len: usize,
+    pub jobs_done: u32,
+    pub jobs_stolen: u32,
+    pub last_temp: u8,
 }
 
 impl WorkerSlot {
     pub const fn new(id: u8) -> Self {
         Self {
-            id, active: false,
+            id,
+            active: false,
             local_deque: [None; LOCAL_DEQUE],
             deque_len: 0,
-            jobs_done: 0, jobs_stolen: 0,
+            jobs_done: 0,
+            jobs_stolen: 0,
             last_temp: 0,
         }
     }
 
     pub fn push_local(&mut self, job: BuildJob) -> bool {
-        if self.deque_len >= LOCAL_DEQUE { return false; }
+        if self.deque_len >= LOCAL_DEQUE {
+            return false;
+        }
         self.local_deque[self.deque_len] = Some(job);
         self.deque_len += 1;
         true
     }
 
     pub fn pop_local(&mut self) -> Option<BuildJob> {
-        if self.deque_len == 0 { return None; }
+        if self.deque_len == 0 {
+            return None;
+        }
         self.deque_len -= 1;
         self.local_deque[self.deque_len].take()
     }
 
     /// Steal one job from another worker's local deque (take from the front)
     pub fn steal_from(&mut self, victim: &mut WorkerSlot) -> Option<BuildJob> {
-        if victim.deque_len == 0 { return None; }
+        if victim.deque_len == 0 {
+            return None;
+        }
         let stolen = victim.local_deque[0].take()?;
         // Shift victim's deque
         for i in 0..victim.deque_len - 1 {
@@ -239,14 +267,18 @@ impl WorkerSlot {
 // ─────────────────────────────────────────────
 
 pub struct TopoSorter {
-    pub in_degree:  [u8; MAX_BUILD_JOBS],
-    pub order:      [u16; MAX_BUILD_JOBS],
-    pub order_len:  usize,
+    pub in_degree: [u8; MAX_BUILD_JOBS],
+    pub order: [u16; MAX_BUILD_JOBS],
+    pub order_len: usize,
 }
 
 impl TopoSorter {
     pub fn new() -> Self {
-        Self { in_degree: [0u8; MAX_BUILD_JOBS], order: [0u16; MAX_BUILD_JOBS], order_len: 0 }
+        Self {
+            in_degree: [0u8; MAX_BUILD_JOBS],
+            order: [0u16; MAX_BUILD_JOBS],
+            order_len: 0,
+        }
     }
 
     /// `edges[i]` = slice of package indices that package i depends on
@@ -280,15 +312,18 @@ impl TopoSorter {
 
         // BFS from zero-indegree nodes
         let mut queue = [0u16; MAX_BUILD_JOBS];
-        let mut qh = 0; let mut qt = 0;
+        let mut qh = 0;
+        let mut qt = 0;
         for i in 0..n {
             if self.in_degree[i] == 0 {
-                queue[qt % MAX_BUILD_JOBS] = i as u16; qt += 1;
+                queue[qt % MAX_BUILD_JOBS] = i as u16;
+                qt += 1;
             }
         }
 
         while qh < qt {
-            let node = queue[qh % MAX_BUILD_JOBS] as usize; qh += 1;
+            let node = queue[qh % MAX_BUILD_JOBS] as usize;
+            qh += 1;
             if self.order_len < MAX_BUILD_JOBS {
                 self.order[self.order_len] = node as u16;
                 self.order_len += 1;
@@ -299,7 +334,8 @@ impl TopoSorter {
                     if edges[i][j] as usize == node {
                         self.in_degree[i] = self.in_degree[i].saturating_sub(1);
                         if self.in_degree[i] == 0 {
-                            queue[qt % MAX_BUILD_JOBS] = i as u16; qt += 1;
+                            queue[qt % MAX_BUILD_JOBS] = i as u16;
+                            qt += 1;
                         }
                     }
                 }
@@ -315,21 +351,25 @@ impl TopoSorter {
 // ─────────────────────────────────────────────
 
 pub struct HelixScheduler {
-    pub queue:      WorkQueue,
-    pub workers:    [WorkerSlot; MAX_WORKERS],
-    pub governor:   ThermalGovernor,
-    pub topo:       TopoSorter,
+    pub queue: WorkQueue,
+    pub workers: [WorkerSlot; MAX_WORKERS],
+    pub governor: ThermalGovernor,
+    pub topo: TopoSorter,
     pub job_status: [JobStatus; MAX_BUILD_JOBS],
-    pub job_count:  usize,
-    pub total_built:u32,
+    pub job_count: usize,
+    pub total_built: u32,
     pub total_fail: u32,
-    pub max_workers:usize,
+    pub max_workers: usize,
 }
 
 impl HelixScheduler {
     pub fn new(max_workers: usize) -> Self {
         const EMPTY_WORKER: WorkerSlot = WorkerSlot::new(0);
-        let workers = core::array::from_fn(|i| WorkerSlot { id: i as u8, active: i < max_workers.min(MAX_WORKERS), ..EMPTY_WORKER });
+        let workers = core::array::from_fn(|i| WorkerSlot {
+            id: i as u8,
+            active: i < max_workers.min(MAX_WORKERS),
+            ..EMPTY_WORKER
+        });
         Self {
             queue: WorkQueue::new(),
             workers,
@@ -344,7 +384,9 @@ impl HelixScheduler {
     }
 
     pub fn enqueue(&mut self, job: BuildJob) -> bool {
-        if self.job_count >= MAX_BUILD_JOBS { return false; }
+        if self.job_count >= MAX_BUILD_JOBS {
+            return false;
+        }
         self.job_status[self.job_count] = JobStatus::Pending;
         self.job_count += 1;
         self.queue.push(job)
@@ -354,9 +396,8 @@ impl HelixScheduler {
     pub fn dispatch(&mut self) -> Option<(u8, BuildJob)> {
         // Find free active worker
         let active = self.governor.active_workers;
-        let worker_id = (0..active).find(|&w| {
-            self.workers[w].active && self.workers[w].deque_len == 0
-        })?;
+        let worker_id =
+            (0..active).find(|&w| self.workers[w].active && self.workers[w].deque_len == 0)?;
 
         // Try global queue first
         let mut job = self.queue.pop_priority().or_else(|| {
@@ -372,7 +413,11 @@ impl HelixScheduler {
                 let (a, b) = self.workers.split_at_mut(worker_id);
                 (&mut b[0], &mut a[busiest])
             };
-            if worker_id < busiest { lo.steal_from(hi) } else { hi.steal_from(lo) }
+            if worker_id < busiest {
+                lo.steal_from(hi)
+            } else {
+                hi.steal_from(lo)
+            }
         })?;
 
         // Apply thermal override to focus
@@ -394,33 +439,35 @@ impl HelixScheduler {
         self.workers[worker_id].pop_local();
         self.workers[worker_id].jobs_done += 1;
         self.total_built += 1;
-        if let Some(slot) = self.job_status.iter_mut().find(|s|
-            matches!(s, JobStatus::InProgress { worker_id: w } if *w == worker_id as u8)
-        ) {
+        if let Some(slot) = self
+            .job_status
+            .iter_mut()
+            .find(|s| matches!(s, JobStatus::InProgress { worker_id: w } if *w == worker_id as u8))
+        {
             *slot = JobStatus::Done { inode };
         }
     }
 
     pub fn stats(&self) -> HelixStats {
         HelixStats {
-            total_built:     self.total_built,
-            total_failed:    self.total_fail,
-            active_workers:  self.governor.active_workers as u8,
-            peak_temp:       self.governor.current_peak,
+            total_built: self.total_built,
+            total_failed: self.total_fail,
+            active_workers: self.governor.active_workers as u8,
+            peak_temp: self.governor.current_peak,
             throttle_events: self.governor.throttle_events,
-            queue_depth:     self.queue.count as u32,
+            queue_depth: self.queue.count as u32,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct HelixStats {
-    pub total_built:     u32,
-    pub total_failed:    u32,
-    pub active_workers:  u8,
-    pub peak_temp:       u8,
+    pub total_built: u32,
+    pub total_failed: u32,
+    pub active_workers: u8,
+    pub peak_temp: u8,
     pub throttle_events: u32,
-    pub queue_depth:     u32,
+    pub queue_depth: u32,
 }
 
 #[cfg(test)]
@@ -432,7 +479,10 @@ mod tests {
         let mut gov = ThermalGovernor::new(4);
         gov.update(0, THROTTLE_TEMP);
         assert_eq!(gov.active_workers, 2);
-        assert_eq!(gov.override_focus, Some(OptimizationFocus::ThermalEfficiency));
+        assert_eq!(
+            gov.override_focus,
+            Some(OptimizationFocus::ThermalEfficiency)
+        );
     }
 
     #[test]
@@ -445,11 +495,13 @@ mod tests {
     #[test]
     fn topo_sorter_handles_linear_chain() {
         let mut topo = TopoSorter::new();
-        let mut edges  = [[0u16; 16]; MAX_BUILD_JOBS];
-        let mut elens  = [0u8; MAX_BUILD_JOBS];
+        let mut edges = [[0u16; 16]; MAX_BUILD_JOBS];
+        let mut elens = [0u8; MAX_BUILD_JOBS];
         // 0 depends on 1, 1 depends on 2
-        edges[0][0] = 1; elens[0] = 1;
-        edges[1][0] = 2; elens[1] = 1;
+        edges[0][0] = 1;
+        elens[0] = 1;
+        edges[1][0] = 2;
+        elens[1] = 1;
         assert!(topo.sort(3, &edges, &elens));
         // 2 should come first in build order
         assert_eq!(topo.order[0], 2);

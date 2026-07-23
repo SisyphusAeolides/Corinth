@@ -33,10 +33,10 @@
 use crate::dna::OptimizationFocus;
 
 pub const MAX_IR_INSTRUCTIONS: usize = 16384;
-pub const MAX_INLINE_DEPTH:    usize = 4;
-pub const MAX_UNROLL_FACTOR:   usize = 8;
-pub const MAX_FUNCTIONS:       usize = 64;
-pub const INSTRUCTION_BYTES:   usize = 4;
+pub const MAX_INLINE_DEPTH: usize = 4;
+pub const MAX_UNROLL_FACTOR: usize = 8;
+pub const MAX_FUNCTIONS: usize = 64;
+pub const INSTRUCTION_BYTES: usize = 4;
 
 // ─────────────────────────────────────────────
 // IR INSTRUCTION
@@ -45,23 +45,42 @@ pub const INSTRUCTION_BYTES:   usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Instr {
     pub opcode: u8,
-    pub a:      u8,
-    pub b:      u8,
-    pub flags:  u8,
+    pub a: u8,
+    pub b: u8,
+    pub flags: u8,
 }
 
 impl Instr {
-    pub const NOP:  Self = Self { opcode: 0x00, a: 0, b: 0, flags: 0 };
-    pub const DEAD: Self = Self { opcode: 0xFF, a: 0, b: 0, flags: 0 };
+    pub const NOP: Self = Self {
+        opcode: 0x00,
+        a: 0,
+        b: 0,
+        flags: 0,
+    };
+    pub const DEAD: Self = Self {
+        opcode: 0xFF,
+        a: 0,
+        b: 0,
+        flags: 0,
+    };
 
     pub const fn from_bytes(bytes: [u8; 4]) -> Self {
-        Self { opcode: bytes[0], a: bytes[1], b: bytes[2], flags: bytes[3] }
+        Self {
+            opcode: bytes[0],
+            a: bytes[1],
+            b: bytes[2],
+            flags: bytes[3],
+        }
     }
     pub const fn to_bytes(self) -> [u8; 4] {
         [self.opcode, self.a, self.b, self.flags]
     }
-    pub const fn is_dead(self) -> bool { self.opcode == 0xFF }
-    pub const fn is_nop(self)  -> bool { self.opcode == 0x00 }
+    pub const fn is_dead(self) -> bool {
+        self.opcode == 0xFF
+    }
+    pub const fn is_nop(self) -> bool {
+        self.opcode == 0x00
+    }
     pub const fn is_terminator(self) -> bool {
         matches!(self.opcode, 0x03 | 0x04 | 0x06) // JMP, JZ, RET
     }
@@ -72,13 +91,16 @@ impl Instr {
 // ─────────────────────────────────────────────
 
 pub struct IrBuffer {
-    pub instrs:  [Instr; MAX_IR_INSTRUCTIONS],
-    pub len:     usize,
+    pub instrs: [Instr; MAX_IR_INSTRUCTIONS],
+    pub len: usize,
 }
 
 impl IrBuffer {
     pub fn new() -> Self {
-        Self { instrs: [Instr::NOP; MAX_IR_INSTRUCTIONS], len: 0 }
+        Self {
+            instrs: [Instr::NOP; MAX_IR_INSTRUCTIONS],
+            len: 0,
+        }
     }
 
     pub fn decode_from(bytes: &[u8]) -> Self {
@@ -87,7 +109,7 @@ impl IrBuffer {
         let count = chunks.min(MAX_IR_INSTRUCTIONS);
         for i in 0..count {
             let off = i * INSTRUCTION_BYTES;
-            let b = [bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]];
+            let b = [bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]];
             buf.instrs[i] = Instr::from_bytes(b);
         }
         buf.len = count;
@@ -99,13 +121,16 @@ impl IrBuffer {
         for i in 0..count {
             let off = i * INSTRUCTION_BYTES;
             let b = self.instrs[i].to_bytes();
-            output[off..off+4].copy_from_slice(&b);
+            output[off..off + 4].copy_from_slice(&b);
         }
         count * INSTRUCTION_BYTES
     }
 
     pub fn live_count(&self) -> usize {
-        self.instrs[..self.len].iter().filter(|i| !i.is_dead()).count()
+        self.instrs[..self.len]
+            .iter()
+            .filter(|i| !i.is_dead())
+            .count()
     }
 }
 
@@ -118,24 +143,34 @@ impl IrBuffer {
 
 pub struct FunctionTable {
     pub entries: [FnEntry; MAX_FUNCTIONS],
-    pub count:   usize,
+    pub count: usize,
 }
 
 #[derive(Clone, Copy)]
 pub struct FnEntry {
-    pub fn_id:       u8,
-    pub start:       usize,  // instruction index in a shared body buffer
-    pub len:         usize,  // instruction count
-    pub inline_cost: u8,     // estimated cycles saved by inlining
+    pub fn_id: u8,
+    pub start: usize,    // instruction index in a shared body buffer
+    pub len: usize,      // instruction count
+    pub inline_cost: u8, // estimated cycles saved by inlining
 }
 
 impl FunctionTable {
     pub const fn new() -> Self {
-        Self { entries: [FnEntry { fn_id: 0, start: 0, len: 0, inline_cost: 0 }; MAX_FUNCTIONS], count: 0 }
+        Self {
+            entries: [FnEntry {
+                fn_id: 0,
+                start: 0,
+                len: 0,
+                inline_cost: 0,
+            }; MAX_FUNCTIONS],
+            count: 0,
+        }
     }
 
     pub fn register(&mut self, entry: FnEntry) -> bool {
-        if self.count >= MAX_FUNCTIONS { return false; }
+        if self.count >= MAX_FUNCTIONS {
+            return false;
+        }
         self.entries[self.count] = entry;
         self.count += 1;
         true
@@ -147,13 +182,19 @@ impl FunctionTable {
 }
 
 pub struct InlinerPass {
-    pub inline_depth:  usize,
+    pub inline_depth: usize,
     pub sites_inlined: u32,
-    pub bytes_saved:   u32,
+    pub bytes_saved: u32,
 }
 
 impl InlinerPass {
-    pub fn new() -> Self { Self { inline_depth: 0, sites_inlined: 0, bytes_saved: 0 } }
+    pub fn new() -> Self {
+        Self {
+            inline_depth: 0,
+            sites_inlined: 0,
+            bytes_saved: 0,
+        }
+    }
 
     /// Inline all INLINE_SITE(fn_id) instructions in `buf`, using bodies from `body_buf`.
     /// `body_buf`: a flat array of instructions for all functions (FnEntry.start indexes into it).
@@ -163,22 +204,33 @@ impl InlinerPass {
         body_buf: &[Instr; MAX_IR_INSTRUCTIONS],
         table: &FunctionTable,
     ) {
-        if self.inline_depth >= MAX_INLINE_DEPTH { return; }
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            return;
+        }
         self.inline_depth += 1;
 
         let mut i = 0usize;
         while i < buf.len {
             let instr = buf.instrs[i];
-            if instr.opcode != 0x09 { i += 1; continue; } // INLINE_SITE
+            if instr.opcode != 0x09 {
+                i += 1;
+                continue;
+            } // INLINE_SITE
 
             let fn_id = instr.a;
             let entry = match table.lookup(fn_id) {
                 Some(e) => *e,
-                None => { i += 1; continue; }
+                None => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Guard: don't inline if body is too large (would overflow buffer)
-            if buf.len + entry.len > MAX_IR_INSTRUCTIONS { i += 1; continue; }
+            if buf.len + entry.len > MAX_IR_INSTRUCTIONS {
+                i += 1;
+                continue;
+            }
 
             // Shift everything after i rightward by (entry.len - 1) to make room
             let shift = entry.len.saturating_sub(1);
@@ -222,51 +274,71 @@ impl InlinerPass {
 // ─────────────────────────────────────────────
 
 pub struct DcePass {
-    pub dead_count:    u32,
+    pub dead_count: u32,
     pub bytes_removed: u32,
 }
 
 impl DcePass {
-    pub fn new() -> Self { Self { dead_count: 0, bytes_removed: 0 } }
+    pub fn new() -> Self {
+        Self {
+            dead_count: 0,
+            bytes_removed: 0,
+        }
+    }
 
     pub fn run(&mut self, buf: &mut IrBuffer) {
-        if buf.len == 0 { return; }
+        if buf.len == 0 {
+            return;
+        }
 
         const BITSET_WORDS: usize = MAX_IR_INSTRUCTIONS / 64 + 1;
         let mut reachable = [0u64; BITSET_WORDS];
 
-        let mut queue  = [0u16; MAX_IR_INSTRUCTIONS];
-        let mut qhead  = 0usize;
-        let mut qtail  = 0usize;
+        let mut queue = [0u16; MAX_IR_INSTRUCTIONS];
+        let mut qhead = 0usize;
+        let mut qtail = 0usize;
 
         // Mark entry point reachable
         Self::mark(&mut reachable, 0);
-        queue[qtail] = 0; qtail += 1;
+        queue[qtail] = 0;
+        qtail += 1;
 
         while qhead < qtail {
-            let pc = queue[qhead] as usize; qhead += 1;
-            if pc >= buf.len { continue; }
+            let pc = queue[qhead] as usize;
+            qhead += 1;
+            if pc >= buf.len {
+                continue;
+            }
 
             let instr = buf.instrs[pc];
-            if instr.is_dead() { continue; }
+            if instr.is_dead() {
+                continue;
+            }
 
             // Sequential successor (unless unconditional JMP or RET)
             if !matches!(instr.opcode, 0x03 | 0x06) {
                 let next = pc + 1;
                 if next < buf.len && !Self::is_marked(&reachable, next) {
                     Self::mark(&mut reachable, next);
-                    if qtail < MAX_IR_INSTRUCTIONS { queue[qtail] = next as u16; qtail += 1; }
+                    if qtail < MAX_IR_INSTRUCTIONS {
+                        queue[qtail] = next as u16;
+                        qtail += 1;
+                    }
                 }
             }
 
             // Branch/jump target
             match instr.opcode {
-                0x03 | 0x04 => { // JMP, JZ
+                0x03 | 0x04 => {
+                    // JMP, JZ
                     let offset = instr.a as i8;
                     let target = (pc as isize + offset as isize) as usize;
                     if target < buf.len && !Self::is_marked(&reachable, target) {
                         Self::mark(&mut reachable, target);
-                        if qtail < MAX_IR_INSTRUCTIONS { queue[qtail] = target as u16; qtail += 1; }
+                        if qtail < MAX_IR_INSTRUCTIONS {
+                            queue[qtail] = target as u16;
+                            qtail += 1;
+                        }
                     }
                 }
                 _ => {}
@@ -300,37 +372,54 @@ impl DcePass {
 
 pub struct UnrollerPass {
     pub loops_unrolled: u32,
-    pub instrs_added:   u32,
+    pub instrs_added: u32,
 }
 
 impl UnrollerPass {
-    pub fn new() -> Self { Self { loops_unrolled: 0, instrs_added: 0 } }
+    pub fn new() -> Self {
+        Self {
+            loops_unrolled: 0,
+            instrs_added: 0,
+        }
+    }
 
     pub fn run(&mut self, buf: &mut IrBuffer) {
         let mut i = 0usize;
         while i < buf.len {
-            if buf.instrs[i].opcode != 0x07 { i += 1; continue; } // LOOP_BEGIN
+            if buf.instrs[i].opcode != 0x07 {
+                i += 1;
+                continue;
+            } // LOOP_BEGIN
             let trip_count = (buf.instrs[i].a as usize).min(MAX_UNROLL_FACTOR);
-            if trip_count < 2 { i += 1; continue; }
+            if trip_count < 2 {
+                i += 1;
+                continue;
+            }
 
             // Find matching LOOP_END
             let loop_start = i + 1; // first instruction of body
-            let loop_end   = match self.find_loop_end(buf, i) {
+            let loop_end = match self.find_loop_end(buf, i) {
                 Some(e) => e,
-                None => { i += 1; continue; }
+                None => {
+                    i += 1;
+                    continue;
+                }
             };
             let body_len = loop_end - loop_start;
             if body_len == 0 || body_len * trip_count + buf.len > MAX_IR_INSTRUCTIONS {
-                i += 1; continue;
+                i += 1;
+                continue;
             }
 
             // Capture body
             let mut body = [Instr::NOP; 256];
             let capture = body_len.min(256);
-            for k in 0..capture { body[k] = buf.instrs[loop_start + k]; }
+            for k in 0..capture {
+                body[k] = buf.instrs[loop_start + k];
+            }
 
             // NOP-out LOOP_BEGIN and LOOP_END
-            buf.instrs[i]        = Instr::NOP;
+            buf.instrs[i] = Instr::NOP;
             buf.instrs[loop_end] = Instr::NOP;
 
             // Insert (trip_count - 1) additional copies of body after loop_end
@@ -341,18 +430,22 @@ impl UnrollerPass {
             for k in (0..tail).rev() {
                 let src = insert_at + k;
                 let dst = src + extra;
-                if dst < MAX_IR_INSTRUCTIONS { buf.instrs[dst] = buf.instrs[src]; }
+                if dst < MAX_IR_INSTRUCTIONS {
+                    buf.instrs[dst] = buf.instrs[src];
+                }
             }
             // Write extra copies
             for copy in 1..trip_count {
                 for k in 0..body_len {
                     let dst = insert_at + (copy - 1) * body_len + k;
-                    if dst < MAX_IR_INSTRUCTIONS { buf.instrs[dst] = body[k]; }
+                    if dst < MAX_IR_INSTRUCTIONS {
+                        buf.instrs[dst] = body[k];
+                    }
                 }
             }
             buf.len = (buf.len + extra).min(MAX_IR_INSTRUCTIONS);
             self.loops_unrolled += 1;
-            self.instrs_added   += (extra) as u32;
+            self.instrs_added += (extra) as u32;
             i = loop_end + 1 + extra; // skip past unrolled body
         }
     }
@@ -364,7 +457,9 @@ impl UnrollerPass {
                 0x07 => depth += 1,
                 0x08 => {
                     depth -= 1;
-                    if depth == 0 { return Some(j); }
+                    if depth == 0 {
+                        return Some(j);
+                    }
                 }
                 _ => {}
             }
@@ -378,14 +473,18 @@ impl UnrollerPass {
 // ─────────────────────────────────────────────
 
 pub struct CrucibleEngine {
-    pub inliner:  InlinerPass,
-    pub dce:      DcePass,
+    pub inliner: InlinerPass,
+    pub dce: DcePass,
     pub unroller: UnrollerPass,
 }
 
 impl CrucibleEngine {
     pub fn new() -> Self {
-        Self { inliner: InlinerPass::new(), dce: DcePass::new(), unroller: UnrollerPass::new() }
+        Self {
+            inliner: InlinerPass::new(),
+            dce: DcePass::new(),
+            unroller: UnrollerPass::new(),
+        }
     }
 
     /// Apply mutation passes according to OptimizationFocus.
@@ -437,20 +536,20 @@ impl CrucibleEngine {
 
     pub fn stats(&self) -> CrucibleStats {
         CrucibleStats {
-            sites_inlined:  self.inliner.sites_inlined,
+            sites_inlined: self.inliner.sites_inlined,
             loops_unrolled: self.unroller.loops_unrolled,
-            dead_removed:   self.dce.dead_count,
-            bytes_saved:    self.dce.bytes_removed + self.inliner.bytes_saved,
+            dead_removed: self.dce.dead_count,
+            bytes_saved: self.dce.bytes_removed + self.inliner.bytes_saved,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct CrucibleStats {
-    pub sites_inlined:  u32,
+    pub sites_inlined: u32,
     pub loops_unrolled: u32,
-    pub dead_removed:   u32,
-    pub bytes_saved:    u32,
+    pub dead_removed: u32,
+    pub bytes_saved: u32,
 }
 
 #[cfg(test)]
@@ -461,7 +560,12 @@ mod tests {
     fn dce_removes_code_after_unconditional_ret() {
         // Build: RET, NOP, NOP (second and third are unreachable)
         let mut buf = IrBuffer::new();
-        buf.instrs[0] = Instr { opcode: 0x06, a: 0, b: 0, flags: 0 }; // RET
+        buf.instrs[0] = Instr {
+            opcode: 0x06,
+            a: 0,
+            b: 0,
+            flags: 0,
+        }; // RET
         buf.instrs[1] = Instr::NOP;
         buf.instrs[2] = Instr::NOP;
         buf.len = 3;
@@ -478,9 +582,24 @@ mod tests {
     fn unroller_replicates_loop_body() {
         let mut buf = IrBuffer::new();
         // LOOP_BEGIN count=2, MOV, LOOP_END
-        buf.instrs[0] = Instr { opcode: 0x07, a: 2, b: 0, flags: 0 };
-        buf.instrs[1] = Instr { opcode: 0x01, a: 1, b: 2, flags: 0 }; // MOV r1, r2
-        buf.instrs[2] = Instr { opcode: 0x08, a: 0, b: 0, flags: 0 }; // LOOP_END
+        buf.instrs[0] = Instr {
+            opcode: 0x07,
+            a: 2,
+            b: 0,
+            flags: 0,
+        };
+        buf.instrs[1] = Instr {
+            opcode: 0x01,
+            a: 1,
+            b: 2,
+            flags: 0,
+        }; // MOV r1, r2
+        buf.instrs[2] = Instr {
+            opcode: 0x08,
+            a: 0,
+            b: 0,
+            flags: 0,
+        }; // LOOP_END
         buf.len = 3;
 
         let mut unroller = UnrollerPass::new();
