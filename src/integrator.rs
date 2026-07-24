@@ -47,21 +47,34 @@ pub fn integrate_into_matrix<S: MatrixCommandSink>(
             subject_hash: subject,
             object_hash: stable_name_hash(dependency),
         }) {
-            let _ = sink.submit(MatrixCommand {
-                kind: MatrixCommandKind::AbortService,
-                inode,
-                subject_hash: subject,
-                object_hash: 0,
-            });
-            return Err(error);
+            return abort_after_failure(sink, inode, subject, error);
         }
     }
-    sink.submit(MatrixCommand {
+    if let Err(error) = sink.submit(MatrixCommand {
         kind: MatrixCommandKind::CommitService,
         inode,
         subject_hash: subject,
         object_hash: 0,
+    }) {
+        return abort_after_failure(sink, inode, subject, error);
+    }
+    Ok(())
+}
+
+fn abort_after_failure<S: MatrixCommandSink>(
+    sink: &mut S,
+    inode: u32,
+    subject_hash: u64,
+    operation_error: IntegrationError,
+) -> Result<(), IntegrationError> {
+    sink.submit(MatrixCommand {
+        kind: MatrixCommandKind::AbortService,
+        inode,
+        subject_hash,
+        object_hash: 0,
     })
+    .map_err(|_| IntegrationError::RollbackFailed)?;
+    Err(operation_error)
 }
 
 pub const fn stable_name_hash(name: &str) -> u64 {
@@ -82,6 +95,7 @@ pub enum IntegrationError {
     TransportUnavailable,
     QueueFull,
     Rejected,
+    RollbackFailed,
 }
 
 #[cfg(test)]
@@ -90,36 +104,52 @@ mod tests {
     use crate::dna::{GeneSequence, OptimizationFocus};
 
     struct Capture {
-        commands: [Option<MatrixCommand>; 4],
+        commands: [Option<MatrixCommand>; 5],
         length: usize,
+        fail_kind: Option<MatrixCommandKind>,
+        fail_abort: bool,
     }
 
     impl MatrixCommandSink for Capture {
         fn submit(&mut self, command: MatrixCommand) -> Result<(), IntegrationError> {
             self.commands[self.length] = Some(command);
             self.length += 1;
+            if self.fail_abort && command.kind == MatrixCommandKind::AbortService {
+                return Err(IntegrationError::TransportUnavailable);
+            }
+            if self.fail_kind == Some(command.kind) {
+                return Err(IntegrationError::Rejected);
+            }
             Ok(())
         }
+    }
+
+    fn gene<'artifact>(
+        dependencies: &'artifact [&'artifact str],
+        mutations: &'artifact [OptimizationFocus],
+    ) -> ValidatedGeneSequence<'artifact> {
+        GeneSequence {
+            package_name: "corinth",
+            version_hash: 1,
+            ir_payload: b"ir",
+            causal_dependencies: dependencies,
+            allowed_mutations: mutations,
+        }
+        .validate()
+        .unwrap()
     }
 
     #[test]
     fn emits_begin_edges_and_commit_in_order() {
         let dependencies = ["slope-net"];
         let mutations = [OptimizationFocus::MaximumThroughput];
-        let gene = GeneSequence {
-            package_name: "corinth",
-            version_hash: 1,
-            ir_payload: b"ir",
-            causal_dependencies: &dependencies,
-            allowed_mutations: &mutations,
-        }
-        .validate()
-        .unwrap();
         let mut capture = Capture {
-            commands: [None; 4],
+            commands: [None; 5],
             length: 0,
+            fail_kind: None,
+            fail_abort: false,
         };
-        integrate_into_matrix(gene, 7, &mut capture).unwrap();
+        integrate_into_matrix(gene(&dependencies, &mutations), 7, &mut capture).unwrap();
         assert_eq!(capture.length, 3);
         assert_eq!(
             capture.commands[0].unwrap().kind,
@@ -132,6 +162,77 @@ mod tests {
         assert_eq!(
             capture.commands[2].unwrap().kind,
             MatrixCommandKind::CommitService
+        );
+    }
+
+    #[test]
+    fn commit_rejection_aborts_the_open_transaction() {
+        let mutations = [OptimizationFocus::MaximumThroughput];
+        let mut capture = Capture {
+            commands: [None; 5],
+            length: 0,
+            fail_kind: Some(MatrixCommandKind::CommitService),
+            fail_abort: false,
+        };
+
+        assert_eq!(
+            integrate_into_matrix(gene(&[], &mutations), 7, &mut capture),
+            Err(IntegrationError::Rejected),
+        );
+        assert_eq!(capture.length, 3);
+        assert_eq!(
+            capture.commands[0].unwrap().kind,
+            MatrixCommandKind::BeginService,
+        );
+        assert_eq!(
+            capture.commands[1].unwrap().kind,
+            MatrixCommandKind::CommitService,
+        );
+        assert_eq!(
+            capture.commands[2].unwrap().kind,
+            MatrixCommandKind::AbortService,
+        );
+    }
+
+    #[test]
+    fn dependency_rejection_aborts_the_open_transaction() {
+        let dependencies = ["slope-net"];
+        let mutations = [OptimizationFocus::MaximumThroughput];
+        let mut capture = Capture {
+            commands: [None; 5],
+            length: 0,
+            fail_kind: Some(MatrixCommandKind::AddDependency),
+            fail_abort: false,
+        };
+
+        assert_eq!(
+            integrate_into_matrix(gene(&dependencies, &mutations), 7, &mut capture),
+            Err(IntegrationError::Rejected),
+        );
+        assert_eq!(capture.length, 3);
+        assert_eq!(
+            capture.commands[2].unwrap().kind,
+            MatrixCommandKind::AbortService,
+        );
+    }
+
+    #[test]
+    fn rollback_failure_is_not_reported_as_successful_cleanup() {
+        let mutations = [OptimizationFocus::MaximumThroughput];
+        let mut capture = Capture {
+            commands: [None; 5],
+            length: 0,
+            fail_kind: Some(MatrixCommandKind::CommitService),
+            fail_abort: true,
+        };
+
+        assert_eq!(
+            integrate_into_matrix(gene(&[], &mutations), 7, &mut capture),
+            Err(IntegrationError::RollbackFailed),
+        );
+        assert_eq!(
+            capture.commands[2].unwrap().kind,
+            MatrixCommandKind::AbortService,
         );
     }
 }
