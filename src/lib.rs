@@ -1,6 +1,7 @@
 #![no_std]
 extern crate alloc;
 pub mod alchemist;
+pub mod command;
 pub mod crucible;
 pub mod dna;
 pub mod helix;
