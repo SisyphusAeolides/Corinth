@@ -685,9 +685,11 @@ mod tests {
         assert!(matches!(solver.solve(), SolveResult::Satisfiable { .. }));
         assert_eq!(solver.assignment[gate as usize], 1);
         assert!(solver.backtracks >= 3);
-        assert!(solver.clauses[..usize::from(solver.num_clauses)]
-            .iter()
-            .all(|constraint| constraint.status(&solver.assignment) == ClauseStatus::Satisfied));
+        assert!(
+            solver.clauses[..usize::from(solver.num_clauses)]
+                .iter()
+                .all(|constraint| constraint.status(&solver.assignment) == ClauseStatus::Satisfied)
+        );
     }
 
     #[test]

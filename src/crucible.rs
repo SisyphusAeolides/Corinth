@@ -28,7 +28,6 @@
 //   ThermalEfficiency:  DCE only (smaller code = less fetch energy)
 //   MemoryCompression:  DCE → compact (repack instructions, elide NOPs)
 
-
 use crate::dna::OptimizationFocus;
 
 pub const MAX_IR_INSTRUCTIONS: usize = 16384;
