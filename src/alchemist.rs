@@ -21,7 +21,6 @@
 //
 // No heap in solver hot path — all state in fixed-size arrays
 
-#![allow(dead_code)]
 
 pub const MAX_PACKAGES: usize = 256; // total (name, version) pairs
 pub const MAX_CLAUSES: usize = 1024;

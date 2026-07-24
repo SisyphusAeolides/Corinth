@@ -20,7 +20,7 @@
 //     0x06 = RET
 //     0x07 = LOOP_BEGIN  count (known iteration count in operand A)
 //     0x08 = LOOP_END    (matches most recent LOOP_BEGIN)
-//     0x09 = INLINE_SITE fn_id (placeholder: replace with inlined body)
+//     0x09 = INLINE_SITE fn_id (reserved until a verified inline body is supplied)
 //     0xFF = DEAD  (marked dead by DCE pass)
 //
 // Passes applied in order per OptimizationFocus:
@@ -28,7 +28,6 @@
 //   ThermalEfficiency:  DCE only (smaller code = less fetch energy)
 //   MemoryCompression:  DCE → compact (repack instructions, elide NOPs)
 
-#![allow(dead_code)]
 
 use crate::dna::OptimizationFocus;
 

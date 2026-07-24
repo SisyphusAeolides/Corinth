@@ -22,7 +22,6 @@
 //   When local deque is empty, steals from the busiest other worker
 //   Implemented as a simple scan — no lock needed with single-threaded sim
 
-#![allow(dead_code)]
 
 use crate::dna::OptimizationFocus;
 
