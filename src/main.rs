@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 
-use corinth::command::{CommandResult, execute, parse_argv};
+use corinth::command::{CommandError, CommandResult, execute, parse_argv};
 use corinth::pkg::PackageLedger;
 
 #[global_allocator]
@@ -38,6 +38,11 @@ pub extern "C" fn corinth_start_with_stack(stack_ptr: *const u8) -> ! {
             b"corinth: transaction staged; durable artifact store is unavailable\n",
             69,
         ),
+        Err(CommandError::PackageUnavailable) => finish(
+            b"corinth: package is not rooted in the measured build catalog\n",
+            69,
+        ),
+        Err(CommandError::Package(_)) => finish(b"corinth: package transaction rejected\n", 65),
         Err(_) => finish(
             b"usage: corinth <install|remove|update|search> <package>\n",
             64,

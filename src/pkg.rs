@@ -2,6 +2,7 @@ use crate::alchemist::VariableRegistry;
 
 pub const MAX_INSTALLED_PACKAGES: usize = 128;
 const MAX_TRANSACTION_INTENTS: usize = MAX_INSTALLED_PACKAGES * 2;
+const MAX_ROLLBACK_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PackageId<'a> {
@@ -46,6 +47,26 @@ pub struct TransactionReceipt {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LedgerCheckpoint {
+    packages: [ResolvedPackage; MAX_INSTALLED_PACKAGES],
+    count: u16,
+    generation: u64,
+    state_digest: u64,
+}
+
+impl LedgerCheckpoint {
+    const EMPTY: Self = Self {
+        packages: [ResolvedPackage {
+            name_hash: 0,
+            version_idx: 0,
+        }; MAX_INSTALLED_PACKAGES],
+        count: 0,
+        generation: 0,
+        state_digest: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageError {
     StaleAuthority,
     GenerationExhausted,
@@ -56,7 +77,9 @@ pub enum PackageError {
     ContradictoryIntent,
     ContradictorySelection,
     InvalidResolverState,
+    InvalidPackageIdentity,
     TransactionSealed,
+    RollbackUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +87,8 @@ pub struct PackageLedger {
     packages: [ResolvedPackage; MAX_INSTALLED_PACKAGES],
     count: u16,
     generation: u64,
+    rollback: [LedgerCheckpoint; MAX_ROLLBACK_DEPTH],
+    rollback_count: u8,
 }
 
 impl PackageLedger {
@@ -75,6 +100,8 @@ impl PackageLedger {
             }; MAX_INSTALLED_PACKAGES],
             count: 0,
             generation: 0,
+            rollback: [LedgerCheckpoint::EMPTY; MAX_ROLLBACK_DEPTH],
+            rollback_count: 0,
         }
     }
 
@@ -144,6 +171,7 @@ impl PackageLedger {
             .checked_add(1)
             .ok_or(PackageError::GenerationExhausted)?;
 
+        self.push_checkpoint(previous);
         self.packages = transaction.packages;
         self.count = transaction.count;
         self.generation = next_generation;
@@ -154,6 +182,61 @@ impl PackageLedger {
             removed,
             upgraded,
         })
+    }
+
+    /// Restore the most recent committed image into a new generation. The
+    /// exact current authority is required and history remains fixed-capacity.
+    pub fn rollback(
+        &mut self,
+        authority: TransactionAuthority,
+    ) -> Result<TransactionReceipt, PackageError> {
+        if authority != self.authority() {
+            return Err(PackageError::StaleAuthority);
+        }
+        let index = usize::from(self.rollback_count)
+            .checked_sub(1)
+            .ok_or(PackageError::RollbackUnavailable)?;
+        let checkpoint = self.rollback[index];
+        if checkpoint.generation >= self.generation
+            || checkpoint.state_digest
+                != state_digest(&checkpoint.packages[..usize::from(checkpoint.count)])
+        {
+            return Err(PackageError::RollbackUnavailable);
+        }
+        let (installed, removed, upgraded) = delta(
+            self.installed(),
+            &checkpoint.packages[..usize::from(checkpoint.count)],
+        );
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(PackageError::GenerationExhausted)?;
+        self.packages = checkpoint.packages;
+        self.count = checkpoint.count;
+        self.generation = next_generation;
+        self.rollback_count -= 1;
+        Ok(TransactionReceipt {
+            previous: authority,
+            current: self.authority(),
+            installed,
+            removed,
+            upgraded,
+        })
+    }
+
+    fn push_checkpoint(&mut self, authority: TransactionAuthority) {
+        let count = usize::from(self.rollback_count);
+        if count == MAX_ROLLBACK_DEPTH {
+            self.rollback.copy_within(1.., 0);
+            self.rollback_count -= 1;
+        }
+        self.rollback[usize::from(self.rollback_count)] = LedgerCheckpoint {
+            packages: self.packages,
+            count: self.count,
+            generation: authority.generation,
+            state_digest: authority.state_digest,
+        };
+        self.rollback_count += 1;
     }
 }
 
@@ -262,6 +345,9 @@ impl PackageTransaction {
         if self.sealed {
             return Err(PackageError::TransactionSealed);
         }
+        if name_hash == 0 {
+            return Err(PackageError::InvalidPackageIdentity);
+        }
         if self.touched_names[..usize::from(self.touched_count)].contains(&name_hash) {
             return Err(PackageError::ContradictoryIntent);
         }
@@ -274,6 +360,9 @@ impl PackageTransaction {
     }
 
     fn insert_at(&mut self, index: usize, package: ResolvedPackage) -> Result<(), PackageError> {
+        if package.name_hash == 0 {
+            return Err(PackageError::InvalidPackageIdentity);
+        }
         let count = usize::from(self.count);
         if count == MAX_INSTALLED_PACKAGES {
             return Err(PackageError::CapacityExhausted);
@@ -299,7 +388,10 @@ fn find_name(packages: &[ResolvedPackage], name_hash: u64) -> Result<usize, usiz
 fn canonical(packages: &[ResolvedPackage]) -> bool {
     packages
         .windows(2)
-        .all(|pair| pair[0].name_hash < pair[1].name_hash)
+        .all(|pair| pair[0].name_hash != 0 && pair[0].name_hash < pair[1].name_hash)
+        && packages
+            .last()
+            .map_or(true, |package| package.name_hash != 0)
 }
 
 fn state_digest(packages: &[ResolvedPackage]) -> u64 {
@@ -555,5 +647,38 @@ mod tests {
 
         assert_eq!(left, right);
         assert_eq!(left.authority(), right.authority());
+    }
+
+    #[test]
+    fn rollback_restores_the_previous_image_without_reusing_generation() {
+        let mut ledger = PackageLedger::new();
+        let initial = ledger.authority();
+        commit_packages(&mut ledger, &[package("core", 1)]);
+        let committed = ledger.authority();
+        assert_eq!(ledger.version_of(fnv1a("core")), Some(1));
+        let receipt = ledger.rollback(committed).unwrap();
+        assert_eq!(receipt.previous, committed);
+        assert_eq!(receipt.installed, 0);
+        assert_eq!(receipt.removed, 1);
+        assert_eq!(ledger.version_of(fnv1a("core")), None);
+        assert_eq!(ledger.authority().generation(), initial.generation() + 2);
+        assert_eq!(
+            ledger.rollback(ledger.authority()),
+            Err(PackageError::RollbackUnavailable)
+        );
+    }
+
+    #[test]
+    fn zero_name_hash_cannot_enter_a_transaction() {
+        let ledger = PackageLedger::new();
+        let mut transaction = ledger.begin(ledger.authority()).unwrap();
+        assert_eq!(
+            transaction.install(ResolvedPackage {
+                name_hash: 0,
+                version_idx: 1,
+            }),
+            Err(PackageError::InvalidPackageIdentity)
+        );
+        assert!(transaction.installed().is_empty());
     }
 }

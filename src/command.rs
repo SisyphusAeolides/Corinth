@@ -9,9 +9,11 @@ use slope::env::QuantumArgv;
 
 use crate::alchemist::fnv1a;
 use crate::pkg::{PackageError, PackageLedger, ResolvedPackage, TransactionReceipt};
+use crate::registry::builtin_package;
+
+pub use crate::registry::MAX_PACKAGE_NAME_BYTES;
 
 pub const PACKAGE_VERSION_INDEX: u16 = 1;
-pub const MAX_PACKAGE_NAME_BYTES: usize = 63;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageVerb {
@@ -39,6 +41,7 @@ pub enum CommandError {
     Usage,
     UnknownVerb,
     InvalidPackageName,
+    PackageUnavailable,
     Package(PackageError),
 }
 
@@ -90,15 +93,18 @@ pub fn execute(
 ) -> Result<CommandResult, CommandError> {
     match command.verb {
         PackageVerb::Search => Ok(CommandResult::Search {
-            known: known_package(command.package),
+            known: builtin_package(command.package).is_some(),
         }),
         PackageVerb::Install => {
+            let Some(package) = builtin_package(command.package) else {
+                return Err(CommandError::PackageUnavailable);
+            };
             let authority = ledger.authority();
             let mut transaction = ledger.begin(authority).map_err(CommandError::Package)?;
             transaction
                 .install(ResolvedPackage {
-                    name_hash: command.package_hash,
-                    version_idx: PACKAGE_VERSION_INDEX,
+                    name_hash: package.package_hash,
+                    version_idx: package.version_index,
                 })
                 .map_err(CommandError::Package)?;
             ledger
@@ -121,6 +127,9 @@ pub fn execute(
                 .map_err(CommandError::Package)
         }
         PackageVerb::Update => {
+            if builtin_package(command.package).is_none() {
+                return Err(CommandError::PackageUnavailable);
+            }
             let version = ledger
                 .version_of(command.package_hash)
                 .ok_or(CommandError::Package(PackageError::PackageNotInstalled))?;
@@ -146,10 +155,6 @@ fn valid_package_name(name: &[u8]) -> bool {
         && name.iter().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
-}
-
-fn known_package(name: &[u8]) -> bool {
-    matches!(name, b"boulder" | b"corinth" | b"crest" | b"push")
 }
 
 #[cfg(test)]
@@ -225,6 +230,15 @@ mod tests {
         assert_eq!(
             execute(unknown, &mut PackageLedger::new()),
             Ok(CommandResult::Search { known: false })
+        );
+    }
+
+    #[test]
+    fn install_rejects_an_unrooted_package_identity() {
+        let unknown = parse(&[b"corinth", b"install", b"unknown"]).unwrap();
+        assert_eq!(
+            execute(unknown, &mut PackageLedger::new()),
+            Err(CommandError::PackageUnavailable)
         );
     }
 }
