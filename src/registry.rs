@@ -98,8 +98,7 @@ impl PackageRecord<'_> {
             return Err(RegistryError::InvalidServiceClass);
         }
         if self.artifact_path.len() > MAX_PATH_BYTES
-            || !self.artifact_path.starts_with("root/bin/")
-            || self.artifact_path[9..] != *self.binary
+            || self.artifact_path.strip_prefix("root/bin/") != Some(self.binary)
         {
             return Err(RegistryError::InvalidArtifactPath);
         }
