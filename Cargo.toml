@@ -9,6 +9,7 @@ rust-version.workspace = true
 os-bin = []
 
 [dependencies]
+blacklab = { path = "../../core/blacklab" }
 slope = { path = "../../libraries/slope" }
 
 [lib]
