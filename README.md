@@ -29,8 +29,10 @@ parent pointer can be restored.
 ## Recipe build matrix
 
 Recipes are source-based and use one locked source plus an explicit output
-list. The host executor never invokes a shell; commands are tokenized,
-allow-listed, and run with reproducibility and network policy applied.
+list. Ordinary recipes never invoke a shell; commands are tokenized,
+allow-listed, and run with reproducibility and network policy applied. The
+special `cosmic` adapter is a fixed compatibility boundary for the pinned
+upstream `justfile` and accepts only its build/install phases.
 
 | Recipe system | Supported toolchain examples | Source inputs |
 | --- | --- | --- |
@@ -40,12 +42,15 @@ allow-listed, and run with reproducibility and network policy applied.
 | `idris2` | Idris 2 compiler | Git or local cache |
 | `agda` | Agda compiler/checker | Git or local cache |
 | `cmake`, `meson`, `custom` | native projects using the allow-list | Git or local cache |
+| `cosmic` | pinned COSMIC Epoch workspace adapter | Git with locked submodules |
 
 The source lock, recipe metadata, and measured artifact digest are independent
 checks. crates.io, Git, and local sources are build inputs; they do not grant
 system, driver, or firmware authority. System packages require Arach-native
 metadata, while drivers and firmware must arrive through an Ed25519-verified
 Arach-HWD plan with a compatible Driver ABI and health/rollback policy.
+The COSMIC adapter recursively measures its install tree and rejects symlinks
+before staging the result.
 
 The host API is `hardware::verify_plan` followed by
 `HardwareProvisioner::build_verified`. With the `host-store` feature, the

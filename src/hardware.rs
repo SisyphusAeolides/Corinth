@@ -553,13 +553,17 @@ impl HardwareProvisioner {
         }
 
         let source_dir = self.materialize_sources(&recipe.source, &source_lock)?;
-        for command in &recipe.build.commands {
-            run_build_command(
-                command,
-                &recipe.build.system,
-                &source_dir,
-                recipe.policy.network,
-            )?;
+        if recipe.build.system == "cosmic" {
+            run_cosmic_workspace(&source_dir, recipe.policy.network)?;
+        } else {
+            for command in &recipe.build.commands {
+                run_build_command(
+                    command,
+                    &recipe.build.system,
+                    &source_dir,
+                    recipe.policy.network,
+                )?;
+            }
         }
         let (artifact_digest, outputs) = self.measure_outputs(&recipe, &source_dir, intent)?;
         Ok(HardwareBuildReceipt {
@@ -877,6 +881,9 @@ impl HardwareProvisioner {
         source_dir: &Path,
         intent: &CorinthIntent,
     ) -> Result<(String, Vec<PathBuf>), HardwareError> {
+        if recipe.build.outputs.as_slice() == ["@install-tree"] {
+            return self.measure_install_tree(recipe, source_dir, intent);
+        }
         if recipe.build.outputs.is_empty() {
             return Err(HardwareError::InvalidRecipe(
                 "build.outputs is empty".into(),
@@ -918,6 +925,71 @@ impl HardwareProvisioner {
         let mut published = Vec::with_capacity(entries.len());
         for (relative, bytes) in entries {
             let target = destination.join(safe_relative_path(relative)?);
+            atomic_write(&target, &bytes)?;
+            published.push(target);
+        }
+        Ok((intent.artifact_sha256.clone(), published))
+    }
+
+    fn measure_install_tree(
+        &self,
+        recipe: &RecipeDocument,
+        source_dir: &Path,
+        intent: &CorinthIntent,
+    ) -> Result<(String, Vec<PathBuf>), HardwareError> {
+        let install_root = source_dir.join(".corinth-install");
+        let metadata = fs::symlink_metadata(&install_root)
+            .map_err(|_| HardwareError::OutputRejected("@install-tree".into()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(HardwareError::OutputRejected("@install-tree".into()));
+        }
+        let mut entries = Vec::new();
+        collect_install_files(&install_root, &install_root, &mut entries)?;
+        if entries.is_empty() {
+            return Err(HardwareError::OutputRejected("@install-tree".into()));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        for (relative, bytes) in &entries {
+            total = total
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| HardwareError::OutputRejected(relative.clone()))?;
+            if total > MAX_OUTPUT_BYTES {
+                return Err(HardwareError::OutputRejected(
+                    "COSMIC install tree exceeds the output limit".into(),
+                ));
+            }
+            digest.update(relative.as_bytes());
+            digest.update([0]);
+            digest.update(bytes);
+        }
+        let actual = hex_digest(&digest.finalize());
+        if actual != intent.artifact_sha256 {
+            return Err(HardwareError::ArtifactDigestMismatch {
+                package: intent.name.clone(),
+                expected: intent.artifact_sha256.clone(),
+                actual,
+            });
+        }
+
+        let destination = self.artifact_root.join(format!(
+            "{}-{}-{}",
+            recipe.package.name, recipe.package.version, recipe.package.release
+        ));
+        if let Ok(existing) = fs::symlink_metadata(&destination) {
+            if existing.file_type().is_symlink() || !existing.is_dir() {
+                return Err(HardwareError::OutputRejected(
+                    destination.display().to_string(),
+                ));
+            }
+            reject_symlinks(&destination)?;
+            fs::remove_dir_all(&destination)?;
+        }
+        fs::create_dir_all(&destination)?;
+        let mut published = Vec::with_capacity(entries.len());
+        for (relative, bytes) in entries {
+            let target = destination.join(safe_relative_path(&relative)?);
             atomic_write(&target, &bytes)?;
             published.push(target);
         }
@@ -989,8 +1061,18 @@ fn validate_recipe(
             "build commands and outputs are required".into(),
         ));
     }
-    for output in &recipe.build.outputs {
-        safe_relative_path(output)?;
+    if recipe.build.system == "cosmic" {
+        if recipe.build.commands != ["just build", "just install"]
+            || recipe.build.outputs.as_slice() != ["@install-tree"]
+        {
+            return Err(HardwareError::InvalidRecipe(
+                "COSMIC recipes must use the fixed workspace adapter".into(),
+            ));
+        }
+    } else {
+        for output in &recipe.build.outputs {
+            safe_relative_path(output)?;
+        }
     }
     Ok(())
 }
@@ -1095,7 +1177,16 @@ fn valid_package_atom(value: &str) -> bool {
 fn valid_build_system(value: &str) -> bool {
     matches!(
         value,
-        "cargo" | "c" | "fortran" | "idris2" | "agda" | "make" | "cmake" | "meson" | "custom"
+        "cargo"
+            | "c"
+            | "fortran"
+            | "idris2"
+            | "agda"
+            | "make"
+            | "cmake"
+            | "meson"
+            | "custom"
+            | "cosmic"
     )
 }
 
@@ -1222,6 +1313,96 @@ fn run_build_command(
         .map_err(|error| HardwareError::CommandFailed(error.to_string()))?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(command.into()));
+    }
+    Ok(())
+}
+
+/// The pinned upstream COSMIC workspace is a compatibility build boundary:
+/// its checked-in `justfile` coordinates the component-specific Cargo and
+/// Make builds and installs into a caller-owned root. Corinth does not accept
+/// arbitrary `just` commands; only the fixed `build` and `install` phases are
+/// reached from the `cosmic` recipe system.
+fn run_cosmic_workspace(directory: &Path, network: bool) -> Result<(), HardwareError> {
+    let justfile = directory.join("justfile");
+    let metadata = fs::symlink_metadata(&justfile)
+        .map_err(|_| HardwareError::InvalidSource("COSMIC justfile is missing".into()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(HardwareError::InvalidSource(
+            "COSMIC justfile is not a regular file".into(),
+        ));
+    }
+    run_cosmic_phase(directory, &["build"], network)?;
+    let install_root = directory.join(".corinth-install");
+    if let Ok(existing) = fs::symlink_metadata(&install_root) {
+        if existing.file_type().is_symlink() || !existing.is_dir() {
+            return Err(HardwareError::InvalidSource(
+                "COSMIC install root is unsafe".into(),
+            ));
+        }
+        fs::remove_dir_all(&install_root)?;
+    }
+    fs::create_dir(&install_root)?;
+    let rootdir = format!("rootdir={}", install_root.display());
+    run_cosmic_phase(directory, &[&rootdir, "prefix=/usr", "install"], network)?;
+    reject_symlinks(&install_root)
+}
+
+fn run_cosmic_phase(
+    directory: &Path,
+    arguments: &[&str],
+    network: bool,
+) -> Result<(), HardwareError> {
+    let mut command = Command::new("just");
+    command
+        .args(arguments)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .env("SOURCE_DATE_EPOCH", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    if !network {
+        command.env("CARGO_NET_OFFLINE", "true");
+    }
+    let status = command
+        .status()
+        .map_err(|error| HardwareError::CommandFailed(error.to_string()))?;
+    if !status.success() {
+        return Err(HardwareError::CommandFailed(format!(
+            "just {} failed",
+            arguments.join(" ")
+        )));
+    }
+    Ok(())
+}
+
+fn collect_install_files(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), HardwareError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(HardwareError::OutputRejected(path.display().to_string()));
+        }
+        if metadata.is_dir() {
+            collect_install_files(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| HardwareError::OutputRejected(path.display().to_string()))?
+                .to_str()
+                .ok_or_else(|| HardwareError::OutputRejected(path.display().to_string()))?;
+            safe_relative_path(relative)?;
+            entries.push((
+                relative.to_string(),
+                read_bounded(&path, MAX_OUTPUT_BYTES)
+                    .map_err(|error| HardwareError::OutputRejected(error.to_string()))?,
+            ));
+        } else {
+            return Err(HardwareError::OutputRejected(path.display().to_string()));
+        }
     }
     Ok(())
 }
@@ -1564,6 +1745,26 @@ mod tests {
         ] {
             assert!(allowed_program(system, program));
         }
+        assert!(valid_build_system("cosmic"));
+    }
+
+    #[test]
+    fn cosmic_install_tree_is_the_only_workspace_output() {
+        assert!(safe_relative_path("@install-tree").is_ok());
+        assert!(!valid_build_system("cosmic-shell"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cosmic_install_tree_rejects_symlinks() {
+        let root = std::env::temp_dir().join(format!("corinth-cosmic-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::write(root.join("usr/bin/cosmic-session"), b"session").unwrap();
+        std::os::unix::fs::symlink("cosmic-session", root.join("usr/bin/link")).unwrap();
+        let mut entries = Vec::new();
+        assert!(collect_install_files(&root, &root, &mut entries).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
