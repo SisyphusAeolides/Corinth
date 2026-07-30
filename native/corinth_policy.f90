@@ -1,5 +1,5 @@
 module corinth_policy
-  use, intrinsic :: iso_c_binding, only: c_double, c_int
+  use, intrinsic :: iso_c_binding, only: c_bool, c_double, c_int
   implicit none
 contains
   function arach_corinth_build_score(features, count) result(score) bind(C)
@@ -20,4 +20,16 @@ contains
       + dependency_cached * 0.20_c_double - thermal * 0.20_c_double
     score = max(0.0_c_double, min(1.0_c_double, score))
   end function arach_corinth_build_score
+
+  function arach_corinth_generation_ready(canonical, parent_matches, &
+                                           file_synced, directory_synced) &
+      result(ready) bind(C)
+    logical(c_bool), value :: canonical
+    logical(c_bool), value :: parent_matches
+    logical(c_bool), value :: file_synced
+    logical(c_bool), value :: directory_synced
+    logical(c_bool) :: ready
+
+    ready = canonical .and. parent_matches .and. file_synced .and. directory_synced
+  end function arach_corinth_generation_ready
 end module corinth_policy

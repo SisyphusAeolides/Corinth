@@ -9,6 +9,50 @@ pub struct BuildEvidence {
     pub thermal_pressure: f64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationEvidence {
+    pub canonical: bool,
+    pub parent_matches: bool,
+    pub file_synced: bool,
+    pub directory_synced: bool,
+}
+
+/// Scheduling telemetry only. The filesystem store independently enforces all
+/// four conditions and never consults this result as publication authority.
+pub fn generation_ready(evidence: GenerationEvidence) -> bool {
+    generation_ready_impl(evidence)
+}
+
+#[cfg(feature = "fortran-policy")]
+fn generation_ready_impl(evidence: GenerationEvidence) -> bool {
+    unsafe extern "C" {
+        fn arach_corinth_generation_ready(
+            canonical: bool,
+            parent_matches: bool,
+            file_synced: bool,
+            directory_synced: bool,
+        ) -> bool;
+    }
+    // SAFETY: Fortran `logical(c_bool), value` is ABI-compatible with Rust bool.
+    unsafe {
+        arach_corinth_generation_ready(
+            evidence.canonical,
+            evidence.parent_matches,
+            evidence.file_synced,
+            evidence.directory_synced,
+        )
+    }
+}
+
+#[cfg(not(feature = "fortran-policy"))]
+fn generation_ready_impl(evidence: GenerationEvidence) -> bool {
+    evidence.canonical
+        && evidence.parent_matches
+        && evidence.file_synced
+        && evidence.directory_synced
+}
+
 impl BuildEvidence {
     const fn as_array(self) -> [f64; 4] {
         [
@@ -62,5 +106,20 @@ mod tests {
             thermal_pressure: 0.0,
         });
         assert!(reproducible > unlocked);
+    }
+
+    #[test]
+    fn generation_telemetry_requires_every_durability_signal() {
+        let ready = GenerationEvidence {
+            canonical: true,
+            parent_matches: true,
+            file_synced: true,
+            directory_synced: true,
+        };
+        assert!(generation_ready(ready));
+        assert!(!generation_ready(GenerationEvidence {
+            directory_synced: false,
+            ..ready
+        }));
     }
 }

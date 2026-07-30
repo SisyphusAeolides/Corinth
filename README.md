@@ -16,10 +16,19 @@ Fortran provides build scheduling telemetry that cannot grant trust. Idris 2
 makes source selection total, and Agda proves that crates.io and raw Git sources
 cannot acquire system-driver authority.
 
+The canonical generation codec and `host-store` backend provide the installer
+with durable package-state publication. Generation files are immutable and
+content-addressed; the active pointer is replaced only after the generation is
+written and synchronized. Every image names its exact parent, stale publishers
+are rejected, and rollback requires the current generation digest before the
+parent pointer can be restored. This is durable package state, not yet artifact
+deployment: an artifact transaction must bind verified files to the generation
+before Arach OS can claim a complete installation.
+
 ## Validation
 
 ```sh
 cargo fmt --all -- --check
-cargo test --features fortran-policy
+cargo test --features fortran-policy,host-store
 scripts/check-formal-models.sh
 ```

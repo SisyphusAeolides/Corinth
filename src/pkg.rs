@@ -108,7 +108,7 @@ impl PackageLedger {
     pub fn authority(&self) -> TransactionAuthority {
         TransactionAuthority {
             generation: self.generation,
-            state_digest: state_digest(self.installed()),
+            state_digest: installed_state_digest(self.installed()),
         }
     }
 
@@ -199,7 +199,7 @@ impl PackageLedger {
         let checkpoint = self.rollback[index];
         if checkpoint.generation >= self.generation
             || checkpoint.state_digest
-                != state_digest(&checkpoint.packages[..usize::from(checkpoint.count)])
+                != installed_state_digest(&checkpoint.packages[..usize::from(checkpoint.count)])
         {
             return Err(PackageError::RollbackUnavailable);
         }
@@ -394,7 +394,7 @@ fn canonical(packages: &[ResolvedPackage]) -> bool {
             .map_or(true, |package| package.name_hash != 0)
 }
 
-fn state_digest(packages: &[ResolvedPackage]) -> u64 {
+pub fn installed_state_digest(packages: &[ResolvedPackage]) -> u64 {
     let mut digest = 0xcbf2_9ce4_8422_2325_u64 ^ packages.len() as u64;
     for package in packages {
         digest ^= package.name_hash;

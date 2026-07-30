@@ -32,3 +32,21 @@ gitCannotAuthorizeSystem ()
 
 nativeRepositoryCannotImpersonateHardwareIndex : Not (Admitted arachNative driver)
 nativeRepositoryCannotImpersonateHardwareIndex ()
+
+data Durability : Set where
+  volatile synced : Durability
+
+data Generation : Durability → Set where
+  staged : Generation volatile
+  durable : Generation synced
+
+data Active : Set where
+  published : Generation synced → Active
+
+publish : Generation synced → Active
+publish generation = published generation
+
+data Publishes : Generation volatile → Active → Set where
+
+volatile-cannot-publish : ∀ {generation active} → Publishes generation active → Empty
+volatile-cannot-publish ()
