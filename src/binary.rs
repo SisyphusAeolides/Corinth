@@ -161,9 +161,6 @@ impl BinaryProvisioner {
                 package.name == name && version.is_none_or(|version| package.version == version)
             })
             .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
-        if !self.allow_network {
-            return Err(HardwareError::NetworkNotAllowed);
-        }
         let filename = format!(
             "{}-{}-{}.pkg",
             package.name, package.version, package.release
@@ -174,6 +171,9 @@ impl BinaryProvisioner {
                 .map_err(|error| HardwareError::SourceUnavailable(error.to_string()))?;
             verify_artifact(&bytes, package)?;
         } else {
+            if !self.allow_network {
+                return Err(HardwareError::NetworkNotAllowed);
+            }
             let temporary = destination.with_extension(format!("download-{}", std::process::id()));
             run_curl(&package.url, &temporary, self.artifact_root.as_path())?;
             let bytes = read_bounded(&temporary, MAX_OUTPUT_BYTES)
@@ -266,6 +266,12 @@ impl BinaryProvisioner {
 }
 
 fn verify_artifact(bytes: &[u8], package: &BinaryPackage) -> Result<(), HardwareError> {
+    if bytes.len() as u64 != package.size {
+        return Err(HardwareError::InvalidSource(format!(
+            "binary size mismatch for {}",
+            package.name
+        )));
+    }
     let actual = hex_digest(&Sha256::digest(bytes));
     if actual != package.artifact_sha256 {
         return Err(HardwareError::ArtifactDigestMismatch {
@@ -321,6 +327,10 @@ fn is_https_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SERIAL: AtomicU64 = AtomicU64::new(1);
 
     fn record(scope: PackageScope, repository: RepositoryAuthority) -> BinaryPackage {
         BinaryPackage {
@@ -335,6 +345,17 @@ mod tests {
             url: "https://packages.example.invalid/demo.pkg".into(),
             size: 4,
         }
+    }
+
+    fn test_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "corinth-binary-test-{}-{}",
+            std::process::id(),
+            TEST_SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        root
     }
 
     #[test]
@@ -370,5 +391,32 @@ mod tests {
         index.packages.truncate(1);
         index.packages[0].url = "http://packages.example.invalid/demo.pkg".into();
         assert!(index.validate().is_err());
+    }
+
+    #[test]
+    fn cached_binary_is_usable_without_network() {
+        let root = test_root();
+        let artifacts = root.join("artifacts");
+        let mut package = record(PackageScope::System, RepositoryAuthority::ArachNative);
+        let bytes = b"pkg!";
+        package.size = bytes.len() as u64;
+        package.artifact_sha256 = hex_digest(&Sha256::digest(bytes));
+        let index = VerifiedBinaryIndex {
+            index: BinaryRepositoryIndex {
+                format: BINARY_INDEX_FORMAT,
+                repository: RepositoryAuthority::ArachNative,
+                key_id: "native-key".into(),
+                packages: vec![package.clone()],
+            },
+            key_id: "native-key".into(),
+            index_sha256: "0".repeat(64),
+        };
+        fs::create_dir(&artifacts).unwrap();
+        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(artifacts.join("demo-1.0.0-1.pkg"), bytes).unwrap();
+        let provisioner = BinaryProvisioner::new(artifacts).unwrap();
+        let receipt = provisioner.fetch(&index, "demo", None).unwrap();
+        assert_eq!(receipt.artifact_sha256, package.artifact_sha256);
+        fs::remove_dir_all(root).unwrap();
     }
 }
