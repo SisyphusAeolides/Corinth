@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{format, string::String, string::ToString, vec::Vec};
@@ -24,45 +24,44 @@ impl FilesystemGenerationStore {
             return Err(StoreError::UnsafeRoot);
         }
         if root.exists() {
-            let metadata = fs::symlink_metadata(root).map_err(StoreError::io)?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(StoreError::UnsafeRoot);
-            }
+            validate_private_directory(root)?;
         } else {
             let parent = root.parent().ok_or(StoreError::UnsafeRoot)?;
             let parent_metadata = fs::symlink_metadata(parent).map_err(StoreError::io)?;
             if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
                 return Err(StoreError::UnsafeRoot);
             }
-            fs::create_dir(root).map_err(StoreError::io)?;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(root).map_err(StoreError::io)?;
         }
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(StoreError::io)?;
         let generations = root.join("generations");
         if generations.exists() {
-            let metadata = fs::symlink_metadata(&generations).map_err(StoreError::io)?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(StoreError::UnsafeRoot);
-            }
+            validate_private_directory(&generations)?;
         } else {
-            fs::create_dir(&generations).map_err(StoreError::io)?;
+            let mut builder = fs::DirBuilder::new();
+            builder
+                .mode(0o700)
+                .create(&generations)
+                .map_err(StoreError::io)?;
         }
-        fs::set_permissions(&generations, fs::Permissions::from_mode(0o700))
-            .map_err(StoreError::io)?;
         Ok(Self {
             root: root.to_path_buf(),
             generations,
         })
     }
 
-    pub fn active(&self) -> Result<Option<GenerationDigest>, StoreError> {
-        let path = self.root.join("active");
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {}
+    /// Read the active authority without creating or modifying store state.
+    pub fn inspect_active(root: &Path) -> Result<Option<GenerationDigest>, StoreError> {
+        match fs::symlink_metadata(root) {
+            Ok(_) => validate_private_directory(root)?,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StoreError::io(error)),
         }
-        let bytes = read_bounded_regular(&path, 65)?;
-        decode_pointer(&bytes).map(Some)
+        read_active_pointer(root)
+    }
+
+    pub fn active(&self) -> Result<Option<GenerationDigest>, StoreError> {
+        read_active_pointer(&self.root)
     }
 
     pub fn publish(&self, image_bytes: &[u8]) -> Result<GenerationDigest, StoreError> {
@@ -171,6 +170,7 @@ impl Drop for StoreLock {
 #[derive(Debug)]
 pub enum StoreError {
     UnsafeRoot,
+    InsecurePermissions,
     Io(String),
     Generation(GenerationError),
     InvalidPointer,
@@ -211,6 +211,28 @@ fn read_bounded_regular(path: &Path, limit: u64) -> Result<Vec<u8>, StoreError> 
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes).map_err(StoreError::io)?;
     Ok(bytes)
+}
+
+fn validate_private_directory(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(StoreError::io)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::UnsafeRoot);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(StoreError::InsecurePermissions);
+    }
+    Ok(())
+}
+
+fn read_active_pointer(root: &Path) -> Result<Option<GenerationDigest>, StoreError> {
+    let path = root.join("active");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::io(error)),
+    }
+    let bytes = read_bounded_regular(&path, 65)?;
+    decode_pointer(&bytes).map(Some)
 }
 
 fn replace_pointer(root: &Path, digest: Option<GenerationDigest>) -> Result<(), StoreError> {
@@ -328,6 +350,7 @@ mod tests {
                 TEST_SERIAL.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
     }
@@ -429,5 +452,48 @@ mod tests {
         let store = FilesystemGenerationStore::open(&root.0).unwrap();
         std::os::unix::fs::symlink(root.0.join("missing"), root.0.join("active")).unwrap();
         assert!(matches!(store.active(), Err(StoreError::Io(_))));
+    }
+
+    #[test]
+    fn read_only_inspection_does_not_create_a_store() {
+        let root = TestRoot::new();
+        let absent = root.0.join("absent");
+        assert_eq!(
+            FilesystemGenerationStore::inspect_active(&absent).unwrap(),
+            None
+        );
+        assert!(!absent.exists());
+
+        let store = FilesystemGenerationStore::open(&absent).unwrap();
+        let first = store.publish(&next_image(NO_GENERATION, &[10])).unwrap();
+        assert_eq!(
+            FilesystemGenerationStore::inspect_active(&absent).unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn insecure_existing_store_is_rejected_without_permission_mutation() {
+        let root = TestRoot::new();
+        let store_root = root.0.join("insecure");
+        fs::create_dir(&store_root).unwrap();
+        fs::set_permissions(&store_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            FilesystemGenerationStore::inspect_active(&store_root),
+            Err(StoreError::InsecurePermissions)
+        ));
+        assert!(matches!(
+            FilesystemGenerationStore::open(&store_root),
+            Err(StoreError::InsecurePermissions)
+        ));
+        assert_eq!(
+            fs::symlink_metadata(&store_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 }
