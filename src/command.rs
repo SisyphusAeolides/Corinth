@@ -1,7 +1,7 @@
 //! Strict native command grammar for the Corinth package service.
 //!
 //! Commands stage bounded, authority-checked ledger transactions. Publishing
-//! an artifact requires a durable package store and Boulder's measured-image
+//! an artifact requires a durable package store and Arach's measured-image
 //! registry; this module deliberately exposes the staged result separately so
 //! callers cannot confuse planning with installation.
 

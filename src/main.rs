@@ -23,7 +23,7 @@ core::arch::global_asm!(
 #[unsafe(no_mangle)]
 pub extern "C" fn corinth_start_with_stack(stack_ptr: *const u8) -> ! {
     HEAP.init();
-    // SAFETY: Boulder supplies the documented `[argc][argv][envp]` entry ABI.
+    // SAFETY: Arach supplies the documented `[argc][argv][envp]` entry ABI.
     let argv = unsafe { slope::env::QuantumArgv::from_stack(stack_ptr) };
     let result = parse_argv(&argv).and_then(|command| {
         let mut ledger = PackageLedger::new();

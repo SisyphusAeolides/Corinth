@@ -2,13 +2,14 @@
 //!
 //! The host forge emits a small canonical `package.toml` record. Corinth
 //! parses only that fixed key/value subset, validates every identity and path,
-//! and measures immutable artifact bytes with Sisyphus' SHA-256 primitive.
+//! and measures immutable artifact bytes with Corinth's SHA-256 primitive.
 //! Measurement is an admission token; durable storage and service publication
 //! remain separate authorities.
 
-use blacklab::oureboros::{MAXIMUM_ARTIFACT_BYTES, sha256};
+use sha2::{Digest, Sha256};
 
 use crate::alchemist::fnv1a;
+use crate::source::SourceKind;
 
 pub const PACKAGE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RECORD_BYTES: usize = 4096;
@@ -16,8 +17,12 @@ pub const MAX_PACKAGE_NAME_BYTES: usize = 63;
 pub const MAX_VERSION_BYTES: usize = 63;
 pub const MAX_PATH_BYTES: usize = 127;
 pub const MAX_CATALOG_ENTRIES: usize = 128;
-pub const MAX_ARTIFACT_BYTES: usize = MAXIMUM_ARTIFACT_BYTES;
-pub const NATIVE_TARGET: &str = "x86_64-sisyphus-user";
+pub const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+pub const NATIVE_TARGET: &str = "x86_64-arach-user";
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
 
 const FIELD_SCHEMA: u16 = 1 << 0;
 const FIELD_SOURCE: u16 = 1 << 1;
@@ -339,7 +344,7 @@ pub struct BuiltinPackage {
 
 pub fn builtin_package(name: &[u8]) -> Option<BuiltinPackage> {
     let (name, service_class) = match name {
-        b"boulder" => (b"boulder" as &'static [u8], 1),
+        b"arach" => (b"arach" as &'static [u8], 1),
         b"corinth" => (b"corinth" as &'static [u8], 2),
         b"crest" => (b"crest" as &'static [u8], 3),
         b"push" => (b"push" as &'static [u8], 4),
@@ -489,11 +494,7 @@ fn hex(byte: u8) -> Option<u8> {
 }
 
 fn valid_source(source: &str) -> bool {
-    !source.is_empty()
-        && source.len() <= MAX_PACKAGE_NAME_BYTES
-        && source
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    SourceKind::from_name(source).is_some()
 }
 
 fn valid_name(name: &str) -> bool {
@@ -523,7 +524,7 @@ mod tests {
         let mut text = String::new();
         write!(
             text,
-            "schema_version = 1\nsource = \"crates.io\"\ncrate = \"demo\"\nversion = \"1.2.3\"\nbinary = \"demo\"\nservice_class = 7\npackage_version_index = 1\ntarget = \"x86_64-sisyphus-user\"\nartifact = \"root/bin/demo\"\nartifact_sha256 = \""
+            "schema_version = 1\nsource = \"crates.io\"\ncrate = \"demo\"\nversion = \"1.2.3\"\nbinary = \"demo\"\nservice_class = 7\npackage_version_index = 1\ntarget = \"x86_64-arach-user\"\nartifact = \"root/bin/demo\"\nartifact_sha256 = \""
         )
         .unwrap();
         for byte in digest {

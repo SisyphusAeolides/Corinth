@@ -2,7 +2,7 @@ use crate::dna::{OptimizationFocus, ValidatedGeneSequence};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetArchitecture {
-    X86_64Sisyphus,
+    X86_64Arach,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +37,7 @@ pub struct CorinthCompiler {
 impl CorinthCompiler {
     pub const fn new() -> Self {
         Self {
-            target_architecture: TargetArchitecture::X86_64Sisyphus,
+            target_architecture: TargetArchitecture::X86_64Arach,
             thermal_limit_celsius: 90,
         }
     }

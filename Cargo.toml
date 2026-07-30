@@ -1,16 +1,21 @@
 [package]
 name = "corinth"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/SisyphusAeolides/Corinth"
+description = "Transactional source and binary package manager for Arach OS"
+build = "build.rs"
 
 [features]
+default = []
 os-bin = []
+fortran-policy = []
 
 [dependencies]
-blacklab = { path = "../../core/blacklab" }
-slope = { path = "../../libraries/slope" }
+sha2 = { version = "0.10.9", default-features = false }
+slope = { git = "https://github.com/SisyphusAeolides/Slope.git", rev = "e1279f3a9c17638a70c55493b2851b011452a403" }
 
 [lib]
 path = "src/lib.rs"
@@ -21,5 +26,5 @@ path = "src/main.rs"
 required-features = ["os-bin"]
 test = false
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
