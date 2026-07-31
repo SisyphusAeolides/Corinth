@@ -1344,7 +1344,35 @@ fn run_cosmic_workspace(directory: &Path, network: bool) -> Result<(), HardwareE
     fs::create_dir(&install_root)?;
     let rootdir = format!("rootdir={}", install_root.display());
     run_cosmic_phase(directory, &[&rootdir, "prefix=/usr", "install"], network)?;
+    install_cosmic_greeter_config(directory, &install_root)?;
     reject_symlinks(&install_root)
+}
+
+/// The upstream COSMIC greeter build installs its executable and launcher
+/// through `just install`, while the distribution package owns the greetd
+/// configuration file.  Keep that runtime contract in the pinned COSMIC
+/// adapter so a Corinth install tree cannot advertise a greeter which has no
+/// greetd session definition.
+fn install_cosmic_greeter_config(
+    source_root: &Path,
+    install_root: &Path,
+) -> Result<(), HardwareError> {
+    let source = source_root.join("cosmic-greeter/cosmic-greeter.toml");
+    let metadata = fs::symlink_metadata(&source)
+        .map_err(|_| HardwareError::InvalidSource("COSMIC greetd config is missing".into()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(HardwareError::InvalidSource(
+            "COSMIC greetd config is not a regular file".into(),
+        ));
+    }
+
+    let destination = install_root.join("etc/greetd/cosmic-greeter.toml");
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&source, &destination)?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o644))?;
+    Ok(())
 }
 
 fn run_cosmic_phase(
@@ -1764,6 +1792,32 @@ mod tests {
         std::os::unix::fs::symlink("cosmic-session", root.join("usr/bin/link")).unwrap();
         let mut entries = Vec::new();
         assert!(collect_install_files(&root, &root, &mut entries).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cosmic_adapter_carries_the_greetd_session_config() {
+        let root = std::env::temp_dir().join(format!(
+            "corinth-cosmic-greetd-config-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("cosmic-greeter")).unwrap();
+        fs::write(
+            root.join("cosmic-greeter/cosmic-greeter.toml"),
+            b"[default_session]\ncommand = \"cosmic-greeter-start\"\n",
+        )
+        .unwrap();
+        let install = root.join(".corinth-install");
+        fs::create_dir_all(&install).unwrap();
+
+        install_cosmic_greeter_config(&root, &install).unwrap();
+        let installed = install.join("etc/greetd/cosmic-greeter.toml");
+        assert_eq!(
+            fs::read_to_string(installed).unwrap(),
+            "[default_session]\ncommand = \"cosmic-greeter-start\"\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
