@@ -109,8 +109,7 @@ pub struct VerifiedBinaryIndex {
 
 impl BinaryRepositoryIndex {
     pub fn validate(&self) -> Result<(), HardwareError> {
-        if self.format != BINARY_INDEX_FORMAT || self.key_id.is_empty() || self.packages.is_empty()
-        {
+        if self.format != BINARY_INDEX_FORMAT || self.key_id.is_empty() {
             return Err(HardwareError::InvalidPlan(
                 "invalid binary repository index header".into(),
             ));
@@ -1396,6 +1395,17 @@ mod tests {
         index.packages[0].url = "https://packages.example.invalid/demo.pkg".into();
         index.packages[0].version = "../escape".into();
         assert!(index.validate().is_err());
+    }
+
+    #[test]
+    fn signed_empty_index_is_valid_for_source_fallback() {
+        let index = BinaryRepositoryIndex {
+            format: BINARY_INDEX_FORMAT,
+            repository: RepositoryAuthority::ArachHardware,
+            key_id: "hardware-key".into(),
+            packages: vec![],
+        };
+        assert!(index.validate().is_ok());
     }
 
     #[test]
