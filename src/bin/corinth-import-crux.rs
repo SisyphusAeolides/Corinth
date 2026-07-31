@@ -59,7 +59,9 @@ fn parse_flags(arguments: Vec<String>) -> Result<BTreeMap<String, PathBuf>, Stri
         if !matches!(
             name,
             "pkgfile" | "source-lock" | "target" | "target-signature" | "keyring" | "output"
-        ) || flags.insert(name.to_string(), PathBuf::from(&pair[1])).is_some()
+        ) || flags
+            .insert(name.to_string(), PathBuf::from(&pair[1]))
+            .is_some()
         {
             return Err(usage());
         }
@@ -76,14 +78,12 @@ fn require_exact(flags: &BTreeMap<String, PathBuf>, expected: &[&str]) -> Result
 }
 
 fn required<'a>(flags: &'a BTreeMap<String, PathBuf>, name: &str) -> Result<&'a Path, String> {
-    flags
-        .get(name)
-        .map(PathBuf::as_path)
-        .ok_or_else(usage)
+    flags.get(name).map(PathBuf::as_path).ok_or_else(usage)
 }
 
 fn read_regular(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > LIMIT {
         return Err(format!("{} is not a bounded regular file", path.display()));
     }
@@ -94,9 +94,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("output path must be absolute".into());
     }
-    let parent = path.parent().ok_or_else(|| "output has no parent".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "output has no parent".to_string())?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let temporary = parent.join(format!(".{}.{}.tmp", path.file_name().and_then(|n| n.to_str()).unwrap_or("recipe"), std::process::id()));
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("recipe"),
+        std::process::id()
+    ));
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -104,7 +112,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .mode(0o644)
             .open(&temporary)
             .map_err(|error| error.to_string())?;
-        file.write_all(bytes).and_then(|()| file.sync_all()).map_err(|error| error.to_string())?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string())?;
         fs::rename(&temporary, path).map_err(|error| error.to_string())?;
         Ok(())
     })();

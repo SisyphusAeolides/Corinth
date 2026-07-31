@@ -96,7 +96,12 @@ pub fn parse_nix_export(bytes: &[u8]) -> Result<ArchPackageMetadata, ForeignImpo
         .package
         .release
         .ok_or(ForeignImportError::MissingField("package.release"))?;
-    build_metadata(&manifest, version, release, manifest.package.depends.clone())
+    build_metadata(
+        &manifest,
+        version,
+        release,
+        manifest.package.depends.clone(),
+    )
 }
 
 /// Parse the static metadata subset of a CRUX Pkgfile and bind every source to
@@ -211,8 +216,7 @@ fn validate_manifest(manifest: &ForeignManifest) -> Result<(), ForeignImportErro
                 }
             }
             "archive" => {
-                if !source.sha256.as_deref().is_some_and(valid_digest)
-                    || source.revision.is_some()
+                if !source.sha256.as_deref().is_some_and(valid_digest) || source.revision.is_some()
                 {
                     return Err(ForeignImportError::InvalidField(format!(
                         "archive source lacks SHA-256: {}",
@@ -274,9 +278,7 @@ fn build_metadata(
     })
 }
 
-fn collect_static_assignments(
-    text: &str,
-) -> Result<BTreeMap<String, String>, ForeignImportError> {
+fn collect_static_assignments(text: &str) -> Result<BTreeMap<String, String>, ForeignImportError> {
     if text.contains("$('")
         || text.contains("$(")
         || text.contains("${")
@@ -327,7 +329,11 @@ fn collect_static_assignments(
             return Err(ForeignImportError::UnsupportedSyntax(statement));
         };
         let key = key.trim();
-        if !allowed.contains(&key) || assignments.insert(key.into(), value.trim().into()).is_some() {
+        if !allowed.contains(&key)
+            || assignments
+                .insert(key.into(), value.trim().into())
+                .is_some()
+        {
             return Err(ForeignImportError::UnsupportedSyntax(format!(
                 "unsupported or duplicate CRUX field: {key}"
             )));
@@ -345,7 +351,9 @@ fn scalar_required(
         .ok_or(ForeignImportError::MissingField(key))?;
     let value = unquote(value)?;
     if value.is_empty()
-        || value.bytes().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         || value.contains('$')
     {
         return Err(ForeignImportError::InvalidField(key.into()));
@@ -361,12 +369,17 @@ fn array_required(
 }
 
 fn array_optional(assignments: &BTreeMap<String, String>, key: &str) -> Option<Vec<String>> {
-    assignments.get(key).and_then(|value| parse_array(value).ok())
+    assignments
+        .get(key)
+        .and_then(|value| parse_array(value).ok())
 }
 
 fn parse_array(value: &str) -> Result<Vec<String>, ForeignImportError> {
     let value = value.trim();
-    let Some(inner) = value.strip_prefix('(').and_then(|value| value.strip_suffix(')')) else {
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
         return Err(ForeignImportError::UnsupportedSyntax(
             "CRUX array must use parentheses".into(),
         ));
@@ -400,7 +413,10 @@ fn parse_array(value: &str) -> Result<Vec<String>, ForeignImportError> {
     if !token.is_empty() {
         values.push(token);
     }
-    if values.iter().any(|value| value.is_empty() || value.contains('$')) {
+    if values
+        .iter()
+        .any(|value| value.is_empty() || value.contains('$'))
+    {
         return Err(ForeignImportError::UnsupportedSyntax(
             "CRUX array contains expansion".into(),
         ));
