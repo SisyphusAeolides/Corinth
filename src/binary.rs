@@ -1328,6 +1328,7 @@ fn is_https_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arach_hwd::plan::ProvisionPlan;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1497,6 +1498,87 @@ mod tests {
             store
                 .install_payload(&payload, &package.artifact_sha256, false)
                 .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signed_hardware_plan_installs_binary_payload_to_target() {
+        let root = test_root();
+        let artifact_root = root.join("artifacts");
+        let target = root.join("target");
+        fs::create_dir(&artifact_root).unwrap();
+        fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let mut package = record(PackageScope::Driver, RepositoryAuthority::ArachHardware);
+        package.name = "wifi-driver".into();
+        package.size = 0;
+        let payload = encode_binary_payload(
+            &package,
+            &[BinaryPayloadFile {
+                path: "usr/lib/firmware/wifi.bin".into(),
+                mode: 0o644,
+                bytes: b"firmware".to_vec(),
+            }],
+        )
+        .unwrap();
+        package.size = payload.len() as u64;
+        package.artifact_sha256 = hex_digest(&Sha256::digest(&payload));
+        fs::write(artifact_root.join("wifi-driver-1.0.0-1.pkg"), &payload).unwrap();
+
+        let intent = arach_hwd::plan::CorinthIntent {
+            verb: CorinthVerb::Install,
+            name: package.name.clone(),
+            version: package.version.clone(),
+            scope: package.scope,
+            repository: package.repository,
+            metadata_sha256: package.metadata_sha256.clone(),
+            artifact_sha256: package.artifact_sha256.clone(),
+            source_lock_sha256: package.source_lock_sha256.clone(),
+        };
+        let plan = VerifiedHardwarePlan {
+            plan: ProvisionPlan {
+                schema: arach_hwd::plan::PLAN_SCHEMA,
+                profile_id: "wifi-profile".into(),
+                profile_sha256: "4".repeat(64),
+                signing_key_id: "hardware-key".into(),
+                device_key: "pci:0000:00:00.0".into(),
+                driver_abi: "1.0".into(),
+                package: vec![intent],
+                health: Vec::new(),
+                rollback: arach_hwd::profile::RollbackPolicy {
+                    remove_packages: vec![package.name.clone()],
+                    restore_previous_driver: true,
+                    reboot_if_required: false,
+                },
+                recovery: None,
+            },
+        };
+        let verified = VerifiedBinaryIndex {
+            index: BinaryRepositoryIndex {
+                format: BINARY_INDEX_FORMAT,
+                repository: RepositoryAuthority::ArachHardware,
+                key_id: "hardware-index".into(),
+                packages: vec![package],
+            },
+            key_id: "hardware-index".into(),
+            index_sha256: "5".repeat(64),
+        };
+        let mut provisioner = BinaryProvisioner::new(artifact_root).unwrap();
+        provisioner.allow_network = false;
+        let receipts = provisioner
+            .install_hardware_plan_set_to_root(
+                root.join("state"),
+                target.clone(),
+                &verified,
+                &[plan],
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            fs::read(target.join("usr/lib/firmware/wifi.bin")).unwrap(),
+            b"firmware"
         );
         fs::remove_dir_all(root).unwrap();
     }
