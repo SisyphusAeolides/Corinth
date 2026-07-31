@@ -705,6 +705,88 @@ impl BinaryProvisioner {
         store.install(&receipts)?;
         Ok(receipts)
     }
+
+    /// Install driver and firmware payloads authorized by one or more
+    /// already-verified HWD plans into a target root.  The binary index is
+    /// checked against every plan intent before the first target mutation;
+    /// failures roll back packages installed earlier in this call.
+    pub fn install_hardware_plan_set_to_root(
+        &self,
+        state: PathBuf,
+        target: PathBuf,
+        verified: &VerifiedBinaryIndex,
+        plans: &[VerifiedHardwarePlan],
+    ) -> Result<Vec<BinaryInstallReceipt>, HardwareError> {
+        if plans.is_empty() {
+            return Err(HardwareError::InvalidPlan(
+                "hardware binary installation requires a non-empty plan set".into(),
+            ));
+        }
+        let mut intents = std::collections::BTreeMap::new();
+        for plan in plans {
+            for intent in &plan.plan.package {
+                if !matches!(intent.verb, CorinthVerb::Install)
+                    || !matches!(intent.scope, PackageScope::Driver | PackageScope::Firmware)
+                {
+                    return Err(HardwareError::InvalidPlan(format!(
+                        "binary hardware plan contains a non-driver intent: {}",
+                        intent.name
+                    )));
+                }
+                let Some(package) = verified.index.packages.iter().find(|package| {
+                    package.name == intent.name && package.version == intent.version
+                }) else {
+                    return Err(HardwareError::PackageNotFound(intent.name.clone()));
+                };
+                if package.scope != intent.scope
+                    || package.repository != intent.repository
+                    || package.metadata_sha256 != intent.metadata_sha256
+                    || package.artifact_sha256 != intent.artifact_sha256
+                    || package.source_lock_sha256 != intent.source_lock_sha256
+                {
+                    return Err(HardwareError::InvalidPlan(format!(
+                        "binary index record does not match HWD intent: {}",
+                        intent.name
+                    )));
+                }
+                let key = intent.name.clone();
+                if let Some(previous) = intents.insert(key.clone(), intent) {
+                    if previous.version != intent.version
+                        || previous.metadata_sha256 != intent.metadata_sha256
+                        || previous.artifact_sha256 != intent.artifact_sha256
+                        || previous.source_lock_sha256 != intent.source_lock_sha256
+                    {
+                        return Err(HardwareError::InvalidPlan(format!(
+                            "conflicting package intents across hardware plans: {key}"
+                        )));
+                    }
+                }
+            }
+        }
+        let store = BinaryInstallStore::open(state, target)?;
+        let mut installed = Vec::with_capacity(intents.len());
+        for intent in intents.into_values() {
+            let (receipt, bytes) =
+                self.fetch_bytes(verified, &intent.name, Some(&intent.version))?;
+            let package = verified
+                .index
+                .packages
+                .iter()
+                .find(|package| package.name == intent.name && package.version == intent.version)
+                .ok_or_else(|| HardwareError::PackageNotFound(intent.name.clone()))?;
+            let payload = decode_binary_payload(&bytes, package)?;
+            match store.install_payload(&payload, &receipt.artifact_sha256, false) {
+                Ok(result) => installed.push(result),
+                Err(error) => {
+                    for previous in installed.iter().rev() {
+                        let _ = store.remove(&previous.package);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(installed)
+    }
 }
 
 /// Transactional live-root owner for native binary payloads.
