@@ -20,6 +20,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
+      - name: Preserve Rust byte-string escapes in the patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/patch-kernel-package-adapter.py")
+          text = path.read_text(encoding="utf-8")
+          marker = '    """        output.extend_from_slice(if source.submodules {'
+          if text.count(marker) != 2:
+              raise SystemExit("expected two source-lock patch literals")
+          path.write_text(text.replace(marker, '    r"""        output.extend_from_slice(if source.submodules {'), encoding="utf-8")
+          PY
       - run: python3 scripts/patch-kernel-package-adapter.py
       - run: cargo fmt --all
       - run: >-
