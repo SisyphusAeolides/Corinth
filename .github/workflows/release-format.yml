@@ -24,7 +24,7 @@ jobs:
       - run: git diff --check
       - name: Publish verified formatting
         run: |
-          git rm .github/workflows/release-format.yml .release-format-trigger .release-format-ready .release-format-start
+          git rm .github/workflows/release-format.yml .release-format-trigger .release-format-ready .release-format-start .release-format-pr
           git config user.name "SisyphusAeolides"
           git config user.email "SisyphusAeolides@users.noreply.github.com"
           git add -A
