@@ -18,7 +18,7 @@ host-store = ["dep:libc", "dep:arach-hwd", "dep:serde", "dep:toml"]
 sha2 = { version = "0.10.9", default-features = false }
 slope = { git = "https://github.com/SisyphusAeolides/Slope.git", rev = "0982b44f3d7271903f827b4169cbf69b332a69ef" }
 libc = { version = "=0.2.189", optional = true }
-arach-hwd = { git = "https://github.com/SisyphusAeolides/Arach-HWD.git", rev = "8d515e481fd6d3367bce20815ff032eac3f2eaeb", optional = true }
+arach-hwd = { git = "https://github.com/SisyphusAeolides/Arach-HWD.git", rev = "d8729257c6dcea5ea152f816d0055f08812a680d", optional = true }
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
 toml = { version = "=0.9.12", optional = true }
 
