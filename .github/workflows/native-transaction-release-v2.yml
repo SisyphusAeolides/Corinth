@@ -31,6 +31,17 @@ jobs:
           script = workflow.split(marker, 1)[1].split("\n          PY", 1)[0]
           exec(textwrap.dedent(script), {})
 
+          package_source = Path("src/pkg.rs")
+          package_text = package_source.read_text(encoding="utf-8")
+          invalid_fixture = "registry.intern(index as u64 + 1, index as u16).unwrap();"
+          valid_fixture = "registry.intern(index as u64 + 1, index as u16 + 1).unwrap();"
+          if package_text.count(invalid_fixture) != 2:
+              raise SystemExit("expected exactly two zero-version capacity fixtures")
+          package_source.write_text(
+              package_text.replace(invalid_fixture, valid_fixture),
+              encoding="utf-8",
+          )
+
           ci = Path(".github/workflows/ci.yml")
           text = ci.read_text(encoding="utf-8")
           strict = "cargo clippy --locked --all-targets --features fortran-policy,host-store -- -D warnings"
