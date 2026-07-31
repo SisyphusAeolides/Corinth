@@ -1,0 +1,40 @@
+name: Kernel package adapter release
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install -y gfortran
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - run: python3 scripts/patch-kernel-package-adapter.py
+      - run: cargo fmt --all
+      - run: >-
+          cargo clippy --locked --all-targets --features fortran-policy,host-store --
+          -D warnings
+          -A clippy::new_without_default
+          -A clippy::manual_memcpy
+          -A clippy::needless_range_loop
+          -A clippy::unused_enumerate_index
+      - run: cargo test --locked --features fortran-policy,host-store
+      - run: git diff --check
+      - name: Publish validated source
+        run: |
+          git config user.name "SisyphusAeolides"
+          git config user.email "37166405+SisyphusAeolides@users.noreply.github.com"
+          git add src/hardware.rs src/arch_import.rs
+          git commit -m "Add fixed Arach kernel package adapter"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
