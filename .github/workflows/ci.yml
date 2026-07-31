@@ -1,38 +1,22 @@
 name: Corinth validation
 
 on:
+  push:
   pull_request:
-    types: [synchronize, reopened, ready_for_review]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  publish:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+  rust-fortran:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install -y gfortran
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
-      - run: rustup toolchain install nightly-2026-07-20 --profile minimal --component rust-src --no-self-update
-      - name: Materialize candidate source
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import textwrap
-
-          workflow = Path(".github/workflows/native-transaction-release.yml").read_text(encoding="utf-8")
-          marker = "python3 - <<'PY'\n"
-          source = workflow.split(marker, 1)[1].split("\n          ci = Path(\".github/workflows/ci.yml\")", 1)[0]
-          exec(textwrap.dedent(source), {})
-          PY
-      - run: cargo +stable fmt --all
+      - run: cargo +stable fmt --all -- --check
       - run: >-
           cargo +stable clippy --locked --all-targets --features fortran-policy,host-store --
           -D warnings
@@ -41,6 +25,10 @@ jobs:
           -A clippy::needless_range_loop
           -A clippy::unused_enumerate_index
       - run: cargo +stable test --locked --features fortran-policy,host-store
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+          components: rust-src
       - run: >-
           cargo +nightly-2026-07-20 build --locked --release --features os-bin
           --target targets/x86_64-arach.json
@@ -49,10 +37,15 @@ jobs:
           -Z build-std-features=compiler-builtins-mem
       - run: test -s target/x86_64-arach/release/corinth
       - run: git diff --check
-      - name: Publish validated source
-        run: |
-          git config user.name "SisyphusAeolides"
-          git config user.email "37166405+SisyphusAeolides@users.noreply.github.com"
-          git add src/pkg.rs src/command.rs src/generation.rs targets/x86_64-arach.json
-          git commit -m "Harden native package transactions"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
+  idris-agda:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y build-essential chezscheme libgmp-dev xz-utils curl
+      - uses: actions/cache@v6
+        with:
+          path: target/formal/toolchains
+          key: corinth-formal-idris2-0.8.0-agda-2.8.0-v1
+      - run: scripts/bootstrap-formal-toolchains.sh
+      - run: scripts/check-formal-models.sh
