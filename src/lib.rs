@@ -10,6 +10,8 @@ pub mod binary;
 pub mod command;
 pub mod crucible;
 pub mod dna;
+#[cfg(feature = "host-store")]
+pub mod foreign_import;
 pub mod generation;
 #[cfg(feature = "host-store")]
 pub mod hardware;
