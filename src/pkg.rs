@@ -77,6 +77,7 @@ pub enum PackageError {
     ContradictoryIntent,
     ContradictorySelection,
     InvalidResolverState,
+    InvalidPersistentState,
     InvalidPackageIdentity,
     TransactionSealed,
     RollbackUnavailable,
@@ -103,6 +104,23 @@ impl PackageLedger {
             rollback: [LedgerCheckpoint::EMPTY; MAX_ROLLBACK_DEPTH],
             rollback_count: 0,
         }
+    }
+
+    /// Reconstruct a verified durable generation without manufacturing
+    /// rollback history. The generation codec authenticates the state digest;
+    /// this boundary enforces the ledger's capacity and identity invariants.
+    pub fn restore(generation: u64, packages: &[ResolvedPackage]) -> Result<Self, PackageError> {
+        if packages.len() > MAX_INSTALLED_PACKAGES
+            || (generation == 0 && !packages.is_empty())
+            || !canonical(packages)
+        {
+            return Err(PackageError::InvalidPersistentState);
+        }
+        let mut ledger = Self::new();
+        ledger.packages[..packages.len()].copy_from_slice(packages);
+        ledger.count = packages.len() as u16;
+        ledger.generation = generation;
+        Ok(ledger)
     }
 
     pub fn authority(&self) -> TransactionAuthority {
@@ -292,7 +310,7 @@ impl PackageTransaction {
         self.prepare_intent(name_hash)?;
         let index = find_name(self.installed(), name_hash)
             .map_err(|_| PackageError::PackageNotInstalled)?;
-        if self.packages[index].version_idx != expected_version {
+        if self.packages[index].version_idx != expected_version || replacement_version == 0 {
             return Err(PackageError::VersionPreconditionFailed);
         }
         self.packages[index].version_idx = replacement_version;
@@ -360,7 +378,7 @@ impl PackageTransaction {
     }
 
     fn insert_at(&mut self, index: usize, package: ResolvedPackage) -> Result<(), PackageError> {
-        if package.name_hash == 0 {
+        if package.name_hash == 0 || package.version_idx == 0 {
             return Err(PackageError::InvalidPackageIdentity);
         }
         let count = usize::from(self.count);
@@ -387,11 +405,11 @@ fn find_name(packages: &[ResolvedPackage], name_hash: u64) -> Result<usize, usiz
 
 fn canonical(packages: &[ResolvedPackage]) -> bool {
     packages
-        .windows(2)
-        .all(|pair| pair[0].name_hash != 0 && pair[0].name_hash < pair[1].name_hash)
+        .iter()
+        .all(|package| package.name_hash != 0 && package.version_idx != 0)
         && packages
-            .last()
-            .map_or(true, |package| package.name_hash != 0)
+            .windows(2)
+            .all(|pair| pair[0].name_hash < pair[1].name_hash)
 }
 
 pub fn installed_state_digest(packages: &[ResolvedPackage]) -> u64 {
@@ -537,7 +555,7 @@ mod tests {
         let exact_pre_failure = transaction;
         let mut registry = VariableRegistry::new();
         for index in 0..=MAX_INSTALLED_PACKAGES {
-            let variable = registry.intern(index as u64 + 1, index as u16).unwrap();
+            let variable = registry.intern(index as u64 + 1, index as u16 + 1).unwrap();
             registry.vars[usize::from(variable)].selected = true;
         }
 
@@ -562,7 +580,7 @@ mod tests {
         let mut ledger = PackageLedger::new();
         let mut registry = VariableRegistry::new();
         for index in 0..MAX_INSTALLED_PACKAGES {
-            let variable = registry.intern(index as u64 + 1, index as u16).unwrap();
+            let variable = registry.intern(index as u64 + 1, index as u16 + 1).unwrap();
             registry.vars[usize::from(variable)].selected = true;
         }
         let mut seed = ledger.begin(ledger.authority()).unwrap();
@@ -665,6 +683,36 @@ mod tests {
         assert_eq!(
             ledger.rollback(ledger.authority()),
             Err(PackageError::RollbackUnavailable)
+        );
+    }
+
+    #[test]
+    fn verified_generation_restore_preserves_authority() {
+        let packages = [package("core", 2), package("network", 4)];
+        let ledger = PackageLedger::restore(9, &packages).unwrap();
+        assert_eq!(ledger.installed(), packages);
+        assert_eq!(ledger.authority().generation(), 9);
+        assert_eq!(
+            ledger.authority().state_digest(),
+            installed_state_digest(&packages)
+        );
+        assert_eq!(
+            PackageLedger::restore(0, &packages),
+            Err(PackageError::InvalidPersistentState)
+        );
+    }
+
+    #[test]
+    fn zero_versions_cannot_enter_or_restore() {
+        let ledger = PackageLedger::new();
+        let mut transaction = ledger.begin(ledger.authority()).unwrap();
+        assert_eq!(
+            transaction.install(package("core", 0)),
+            Err(PackageError::InvalidPackageIdentity)
+        );
+        assert_eq!(
+            PackageLedger::restore(1, &[package("core", 0)]),
+            Err(PackageError::InvalidPersistentState)
         );
     }
 
