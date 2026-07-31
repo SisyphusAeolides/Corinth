@@ -15,9 +15,27 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y gfortran
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-      - run: cargo test --locked --features fortran-policy,host-store
+          components: rustfmt,clippy
+      - run: cargo +stable fmt --all -- --check
+      - run: >-
+          cargo +stable clippy --locked --all-targets --features fortran-policy,host-store --
+          -D warnings
+          -A clippy::new_without_default
+          -A clippy::manual_memcpy
+          -A clippy::needless_range_loop
+          -A clippy::unused_enumerate_index
+      - run: cargo +stable test --locked --features fortran-policy,host-store
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+          components: rust-src
+      - run: >-
+          cargo +nightly-2026-07-20 build --locked --release --features os-bin
+          --target targets/x86_64-arach.json
+          -Z json-target-spec
+          -Z build-std=core,alloc,compiler_builtins
+          -Z build-std-features=compiler-builtins-mem
+      - run: test -s target/x86_64-arach/release/corinth
       - run: git diff --check
 
   idris-agda:

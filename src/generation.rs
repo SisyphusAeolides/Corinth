@@ -1,6 +1,8 @@
 //! Canonical durable-generation format shared by native and installer stores.
 
-use crate::pkg::{MAX_INSTALLED_PACKAGES, PackageLedger, ResolvedPackage, installed_state_digest};
+use crate::pkg::{
+    MAX_INSTALLED_PACKAGES, PackageError, PackageLedger, ResolvedPackage, installed_state_digest,
+};
 
 pub const GENERATION_FORMAT: u16 = 1;
 pub const GENERATION_MAGIC: &[u8; 8] = b"ARACHGEN";
@@ -49,6 +51,10 @@ impl GenerationImage {
 
     pub fn packages(&self) -> &[ResolvedPackage] {
         &self.packages[..usize::from(self.count)]
+    }
+
+    pub fn restore_ledger(&self) -> Result<PackageLedger, PackageError> {
+        PackageLedger::restore(self.generation, self.packages())
     }
 
     pub fn encoded_len(&self) -> usize {
@@ -213,7 +219,11 @@ mod tests {
         let image = GenerationImage::from_ledger(&ledger(), [7; 32]);
         let mut bytes = [0; MAX_GENERATION_BYTES];
         let length = image.encode(&mut bytes).unwrap();
-        assert_eq!(GenerationImage::decode(&bytes[..length]), Ok(image));
+        let decoded = GenerationImage::decode(&bytes[..length]).unwrap();
+        assert_eq!(decoded, image);
+        let restored = decoded.restore_ledger().unwrap();
+        assert_eq!(restored.authority().generation(), image.generation());
+        assert_eq!(restored.installed(), image.packages());
         assert_eq!(
             length,
             GENERATION_HEADER_BYTES + 2 * GENERATION_RECORD_BYTES

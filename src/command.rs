@@ -127,19 +127,21 @@ pub fn execute(
                 .map_err(CommandError::Package)
         }
         PackageVerb::Update => {
-            if builtin_package(command.package).is_none() {
+            let Some(package) = builtin_package(command.package) else {
                 return Err(CommandError::PackageUnavailable);
-            }
+            };
             let version = ledger
                 .version_of(command.package_hash)
                 .ok_or(CommandError::Package(PackageError::PackageNotInstalled))?;
-            let replacement = version.checked_add(1).ok_or(CommandError::Package(
-                PackageError::VersionPreconditionFailed,
-            ))?;
+            if package.version_index <= version {
+                return Err(CommandError::Package(
+                    PackageError::VersionPreconditionFailed,
+                ));
+            }
             let authority = ledger.authority();
             let mut transaction = ledger.begin(authority).map_err(CommandError::Package)?;
             transaction
-                .upgrade(command.package_hash, version, replacement)
+                .upgrade(command.package_hash, version, package.version_index)
                 .map_err(CommandError::Package)?;
             ledger
                 .commit(transaction)
@@ -189,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn stages_atomic_install_remove_and_update_without_claiming_persistence() {
+    fn stages_install_and_remove_without_fabricating_an_update() {
         let mut ledger = PackageLedger::new();
         let install = parse(&[b"corinth", b"install", b"crest"]).unwrap();
         let CommandResult::Staged(receipt) = execute(install, &mut ledger).unwrap() else {
@@ -201,12 +203,11 @@ mod tests {
         );
 
         let update = parse(&[b"corinth", b"update", b"crest"]).unwrap();
-        let CommandResult::Staged(receipt) = execute(update, &mut ledger).unwrap() else {
-            panic!("update must stage a transaction")
-        };
         assert_eq!(
-            (receipt.installed, receipt.removed, receipt.upgraded),
-            (0, 0, 1)
+            execute(update, &mut ledger),
+            Err(CommandError::Package(
+                PackageError::VersionPreconditionFailed
+            ))
         );
 
         let remove = parse(&[b"corinth", b"remove", b"crest"]).unwrap();
