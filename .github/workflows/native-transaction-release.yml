@@ -20,7 +20,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
-      - name: Apply transaction integrity changes
+      - run: rustup toolchain install nightly-2026-07-20 --profile minimal --component rust-src --no-self-update
+      - name: Apply verified source transformation
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -63,6 +64,17 @@ jobs:
               """    #[test]\n    fn verified_generation_restore_preserves_authority() {\n        let packages = [package(\"core\", 2), package(\"network\", 4)];\n        let ledger = PackageLedger::restore(9, &packages).unwrap();\n        assert_eq!(ledger.installed(), packages);\n        assert_eq!(ledger.authority().generation(), 9);\n        assert_eq!(\n            ledger.authority().state_digest(),\n            installed_state_digest(&packages)\n        );\n        assert_eq!(\n            PackageLedger::restore(0, &packages),\n            Err(PackageError::InvalidPersistentState)\n        );\n    }\n\n    #[test]\n    fn zero_versions_cannot_enter_or_restore() {\n        let ledger = PackageLedger::new();\n        let mut transaction = ledger.begin(ledger.authority()).unwrap();\n        assert_eq!(\n            transaction.install(package(\"core\", 0)),\n            Err(PackageError::InvalidPackageIdentity)\n        );\n        assert_eq!(\n            PackageLedger::restore(1, &[package(\"core\", 0)]),\n            Err(PackageError::InvalidPersistentState)\n        );\n    }\n\n    #[test]\n    fn zero_name_hash_cannot_enter_a_transaction() {\n""",
           )
 
+          package_source = Path("src/pkg.rs")
+          package_text = package_source.read_text(encoding="utf-8")
+          invalid_fixture = "registry.intern(index as u64 + 1, index as u16).unwrap();"
+          valid_fixture = "registry.intern(index as u64 + 1, index as u16 + 1).unwrap();"
+          if package_text.count(invalid_fixture) != 2:
+              raise SystemExit("expected exactly two zero-version capacity fixtures")
+          package_source.write_text(
+              package_text.replace(invalid_fixture, valid_fixture),
+              encoding="utf-8",
+          )
+
           replace_once(
               "src/command.rs",
               """        PackageVerb::Update => {\n            if builtin_package(command.package).is_none() {\n                return Err(CommandError::PackageUnavailable);\n            }\n            let version = ledger\n                .version_of(command.package_hash)\n                .ok_or(CommandError::Package(PackageError::PackageNotInstalled))?;\n            let replacement = version.checked_add(1).ok_or(CommandError::Package(\n                PackageError::VersionPreconditionFailed,\n            ))?;\n            let authority = ledger.authority();\n            let mut transaction = ledger.begin(authority).map_err(CommandError::Package)?;\n            transaction\n                .upgrade(command.package_hash, version, replacement)\n                .map_err(CommandError::Package)?;\n""",
@@ -95,22 +107,57 @@ jobs:
               """        let decoded = GenerationImage::decode(&bytes[..length]).unwrap();\n        assert_eq!(decoded, image);\n        let restored = decoded.restore_ledger().unwrap();\n        assert_eq!(restored.authority().generation(), image.generation());\n        assert_eq!(restored.installed(), image.packages());\n""",
           )
 
-          replace_once(
-              ".github/workflows/ci.yml",
-              """          components: rustfmt\n      - run: cargo fmt --all -- --check\n      - run: cargo test --locked --features fortran-policy,host-store\n      - run: git diff --check\n""",
-              """          components: rustfmt,clippy\n      - run: cargo fmt --all -- --check\n      - run: cargo clippy --locked --all-targets --features fortran-policy,host-store -- -D warnings\n      - run: cargo test --locked --features fortran-policy,host-store\n      - run: cargo build --locked --features os-bin\n      - run: git diff --check\n""",
-          )
-          PY
-      - run: cargo fmt --all
-      - run: cargo clippy --locked --all-targets --features fortran-policy,host-store -- -D warnings
+          ci = Path(".github/workflows/ci.yml")
+          text = ci.read_text(encoding="utf-8")
+          old = """          components: rustfmt
+      - run: cargo fmt --all -- --check
       - run: cargo test --locked --features fortran-policy,host-store
-      - run: cargo build --locked --features os-bin
+      - run: git diff --check
+"""
+          scoped = """          components: rustfmt,clippy
+      - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable clippy --locked --all-targets --features fortran-policy,host-store -- -D warnings -A clippy::new_without_default -A clippy::manual_memcpy -A clippy::needless_range_loop -A clippy::unused_enumerate_index
+      - run: cargo +stable test --locked --features fortran-policy,host-store
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+          components: rust-src
+      - run: >-
+          cargo +nightly-2026-07-20 build --locked --features os-bin
+          --target targets/x86_64-arach.json
+          -Z json-target-spec
+          -Z build-std=core,alloc,compiler_builtins
+          -Z build-std-features=compiler-builtins-mem
+      - run: test -s target/x86_64-arach/debug/corinth
+      - run: git diff --check
+"""
+          if text.count(old) != 1:
+              raise SystemExit("permanent validation block was not found exactly once")
+          ci.write_text(text.replace(old, scoped), encoding="utf-8")
+          PY
+      - run: cargo +stable fmt --all
+      - run: >-
+          cargo +stable clippy --locked --all-targets --features fortran-policy,host-store --
+          -D warnings
+          -A clippy::new_without_default
+          -A clippy::manual_memcpy
+          -A clippy::needless_range_loop
+          -A clippy::unused_enumerate_index
+      - run: cargo +stable test --locked --features fortran-policy,host-store
+      - run: >-
+          cargo +nightly-2026-07-20 build --locked --features os-bin
+          --target targets/x86_64-arach.json
+          -Z json-target-spec
+          -Z build-std=core,alloc,compiler_builtins
+          -Z build-std-features=compiler-builtins-mem
+      - run: test -s target/x86_64-arach/debug/corinth
       - run: git diff --check
       - name: Publish clean source commit
         run: |
           rm -- .github/workflows/native-transaction-release.yml
+          rm -- .github/workflows/native-transaction-release-v2.yml
           git config user.name "SisyphusAeolides"
           git config user.email "37166405+SisyphusAeolides@users.noreply.github.com"
-          git add src/pkg.rs src/command.rs src/generation.rs .github/workflows/ci.yml .github/workflows/native-transaction-release.yml
+          git add src/pkg.rs src/command.rs src/generation.rs targets/x86_64-arach.json .github/workflows/ci.yml .github/workflows/native-transaction-release.yml .github/workflows/native-transaction-release-v2.yml
           git commit -m "Harden native package transactions"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
