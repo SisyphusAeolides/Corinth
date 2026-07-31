@@ -30,6 +30,16 @@ name = "corinth"
 path = "src/main.rs"
 test = false
 
+[[bin]]
+name = "corinth-import-crux"
+path = "src/bin/corinth-import-crux.rs"
+required-features = ["host-store"]
+
+[[bin]]
+name = "corinth-import-nix"
+path = "src/bin/corinth-import-nix.rs"
+required-features = ["host-store"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
