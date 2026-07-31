@@ -33,6 +33,26 @@ jobs:
           path.write_text(text.replace(marker, '    r"""        output.extend_from_slice(if source.submodules {'), encoding="utf-8")
           PY
       - run: python3 scripts/patch-kernel-package-adapter.py
+      - name: Complete repository source initializer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/hardware.rs")
+          text = path.read_text(encoding="utf-8")
+          old = """            version: None,
+            submodules,
+        })
+"""
+          new = """            version: None,
+            destination: None,
+            submodules,
+        })
+"""
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one repository source initializer, found {text.count(old)}")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
       - run: cargo fmt --all
       - run: >-
           cargo clippy --locked --all-targets --features fortran-policy,host-store --
