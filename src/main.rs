@@ -75,6 +75,7 @@ mod host_cli {
     use std::io::Write;
     use std::path::PathBuf;
 
+    use arach_hwd::catalog::verify_catalog;
     use arach_hwd::plan::{PlanSet, ProvisionPlan};
     use arach_hwd::signature::Keyring;
     use corinth::arch_import::{
@@ -82,13 +83,17 @@ mod host_cli {
         read_repository_pkgbuild, target_profile_for_package,
     };
     use corinth::binary::{BinaryInstallStore, BinaryProvisioner, verify_binary_index};
-    use corinth::hardware::{HardwareError, HardwareProvisioner, HostPackageStore, verify_plan};
+    use corinth::hardware::{
+        HardwareError, HardwareProvisioner, HostPackageStore, verify_plan, verify_plan_set,
+    };
 
     pub fn run() -> Result<(), String> {
         let mut args = env::args().skip(1);
         let verb = args.next().ok_or_else(usage)?;
         let mut plan = None;
         let mut profile = None;
+        let mut profiles = None;
+        let mut catalog_lock = None;
         let mut signature = None;
         let mut keyring = None;
         let mut recipes = None;
@@ -110,6 +115,10 @@ mod host_cli {
             match argument.as_str() {
                 "--plan" => plan = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--profile" => profile = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--profiles" => profiles = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--catalog-lock" => {
+                    catalog_lock = Some(PathBuf::from(args.next().ok_or_else(usage)?))
+                }
                 "--signature" => signature = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--keyring" => keyring = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--recipes" => recipes = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
@@ -272,8 +281,6 @@ mod host_cli {
                 }
                 let work = work.ok_or_else(usage)?;
                 let plan_path = plan.ok_or_else(usage)?;
-                let profile_path = profile.ok_or_else(usage)?;
-                let signature_path = signature.ok_or_else(usage)?;
                 let keyring_path = keyring.ok_or_else(usage)?;
                 let recipe_root = if let Some(root) = recipes {
                     root
@@ -288,19 +295,62 @@ mod host_cli {
                     return Err(usage());
                 };
                 let text = fs::read_to_string(plan_path).map_err(|e| e.to_string())?;
-                let plan = parse_plan(&text)?;
-                let profile_bytes = fs::read(profile_path).map_err(|e| e.to_string())?;
-                let signature_text =
-                    fs::read_to_string(signature_path).map_err(|e| e.to_string())?;
+                let plans = parse_plans(&text)?;
                 let trusted = Keyring::load(&keyring_path).map_err(|e| e.to_string())?;
-                let verified =
-                    verify_plan(plan, &profile_bytes, &signature_text, &trusted).map_err(render)?;
+                let verified = if let Some(profile_path) = profile {
+                    if plans.plan.len() != 1 {
+                        return Err(
+                            "a multi-device plan set requires --profiles and --catalog-lock".into(),
+                        );
+                    }
+                    let signature_path = signature.ok_or_else(usage)?;
+                    let profile_bytes = fs::read(profile_path).map_err(|e| e.to_string())?;
+                    let signature_text =
+                        fs::read_to_string(signature_path).map_err(|e| e.to_string())?;
+                    vec![
+                        verify_plan(
+                            plans.plan.into_iter().next().expect("one plan"),
+                            &profile_bytes,
+                            &signature_text,
+                            &trusted,
+                        )
+                        .map_err(render)?,
+                    ]
+                } else {
+                    let profiles = profiles.ok_or_else(usage)?;
+                    let catalog_lock = catalog_lock.ok_or_else(usage)?;
+                    verify_catalog(&catalog_lock, &profiles, &keyring_path)
+                        .map_err(|error| error.to_string())?;
+                    let documents = load_profile_documents(&profiles, &trusted)?;
+                    verify_plan_set(plans, &documents).map_err(render)?
+                };
                 let mut builder = HardwareProvisioner::new(work, artifacts).map_err(render)?;
                 builder.allow_network = allow_network;
                 let receipts = builder
-                    .build_verified(&verified, &recipe_root)
+                    .build_verified_set(&verified, &recipe_root)
                     .map_err(render)?;
-                if verb == "update" {
+                if let Some(target) = root {
+                    if verb == "update" {
+                        return Err(
+                            "source hardware target updates require an explicit rollback plan"
+                                .into(),
+                        );
+                    }
+                    let installed = builder
+                        .install_plan_set_to_root(state, target, &verified, &receipts)
+                        .map_err(render)?;
+                    for receipt in installed {
+                        println!(
+                            "{} {}-{} installed={} files={}",
+                            verb,
+                            receipt.package,
+                            receipt.release,
+                            receipt.artifact_sha256,
+                            receipt.files.len()
+                        );
+                    }
+                    return Ok(());
+                } else if verb == "update" {
                     store.update(&receipts).map_err(render)?;
                 } else {
                     store.install(&receipts).map_err(render)?;
@@ -317,14 +367,72 @@ mod host_cli {
         Ok(())
     }
 
-    fn parse_plan(text: &str) -> Result<ProvisionPlan, String> {
+    fn parse_plans(text: &str) -> Result<PlanSet, String> {
         if let Ok(set) = toml::from_str::<PlanSet>(text) {
-            if set.plan.len() != 1 {
-                return Err("host install expects exactly one plan".into());
+            if set.plan.is_empty() {
+                return Err("hardware plan set is empty".into());
             }
-            return Ok(set.plan.into_iter().next().expect("one plan"));
+            return Ok(set);
         }
-        toml::from_str(text).map_err(|error| error.to_string())
+        let plan: ProvisionPlan = toml::from_str(text).map_err(|error| error.to_string())?;
+        Ok(PlanSet {
+            schema: arach_hwd::plan::PLAN_SCHEMA,
+            plan: vec![plan],
+        })
+    }
+
+    fn load_profile_documents(
+        directory: &std::path::Path,
+        keyring: &Keyring,
+    ) -> Result<Vec<(Vec<u8>, String, Keyring)>, String> {
+        fn walk(
+            directory: &std::path::Path,
+            paths: &mut Vec<std::path::PathBuf>,
+        ) -> Result<(), String> {
+            let mut entries = fs::read_dir(directory)
+                .map_err(|error| format!("{}: {error}", directory.display()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "symlink in hardware profile catalog: {}",
+                        path.display()
+                    ));
+                }
+                if metadata.is_dir() {
+                    walk(&path, paths)?;
+                } else if metadata.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "toml")
+                {
+                    paths.push(path);
+                }
+            }
+            Ok(())
+        }
+
+        let mut paths = Vec::new();
+        walk(directory, &mut paths)?;
+        if paths.is_empty() {
+            return Err("hardware profile catalog contains no profiles".into());
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+                let signature = fs::read_to_string(format!("{}.sig", path.display()))
+                    .map_err(|error| error.to_string())?;
+                keyring
+                    .verify(&bytes, &signature)
+                    .map_err(|error| error.to_string())?;
+                Ok((bytes, signature, keyring.clone()))
+            })
+            .collect()
     }
 
     fn render(error: HardwareError) -> String {
@@ -332,7 +440,7 @@ mod host_cli {
     }
 
     fn usage() -> String {
-        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild (--pkgbuild PKGBUILD | --pkgbuild-git URL REV PATH) --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE [--work DIR] [--allow-network]".into()
+        "usage: corinth <install|update> --plan PLAN (--profile PROFILE --signature SIG | --profiles DIR --catalog-lock LOCK) --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild (--pkgbuild PKGBUILD | --pkgbuild-git URL REV PATH) --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE [--work DIR] [--allow-network]".into()
     }
 
     fn write_recipe_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {

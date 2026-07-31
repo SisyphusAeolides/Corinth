@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -488,13 +488,181 @@ impl HardwareProvisioner {
         plan: &VerifiedHardwarePlan,
         recipes_root: &Path,
     ) -> Result<Vec<HardwareBuildReceipt>, HardwareError> {
+        self.build_verified_set(std::slice::from_ref(plan), recipes_root)
+    }
+
+    /// Build the union of several device plans.  A catalog commonly resolves
+    /// the same firmware or driver for multiple devices; build it once and
+    /// retain deterministic package order rather than rebuilding or
+    /// overwriting the measured artifact.
+    pub fn build_verified_set(
+        &self,
+        plans: &[VerifiedHardwarePlan],
+        recipes_root: &Path,
+    ) -> Result<Vec<HardwareBuildReceipt>, HardwareError> {
         fs::create_dir_all(&self.work_root)?;
         fs::create_dir_all(&self.artifact_root)?;
-        let mut receipts = Vec::with_capacity(plan.plan.package.len());
-        for intent in &plan.plan.package {
-            receipts.push(self.build_intent(intent, recipes_root)?);
+        let mut intents = std::collections::BTreeMap::new();
+        for plan in plans {
+            for intent in &plan.plan.package {
+                let key = (intent.name.clone(), intent.version.clone());
+                if let Some(previous) = intents.insert(key.clone(), intent) {
+                    if previous.metadata_sha256 != intent.metadata_sha256
+                        || previous.artifact_sha256 != intent.artifact_sha256
+                        || previous.source_lock_sha256 != intent.source_lock_sha256
+                    {
+                        return Err(HardwareError::InvalidPlan(format!(
+                            "conflicting package intents across hardware plans: {}",
+                            intent.name
+                        )));
+                    }
+                }
+            }
         }
-        Ok(receipts)
+        intents
+            .into_values()
+            .map(|intent| self.build_intent(intent, recipes_root))
+            .collect()
+    }
+
+    /// Install the measured output of a verified hardware plan into a target
+    /// root.  Hardware recipes are required to publish `@install-tree`; this
+    /// keeps the target paths explicit (for example `usr/lib/firmware/...` or
+    /// `usr/lib/modules/...`) instead of guessing from a compiler output path.
+    /// The binary install store owns every file and will refuse conflicts,
+    /// symlinks, or modified files on rollback/removal.
+    pub fn install_plan_to_root(
+        &self,
+        state: PathBuf,
+        target: PathBuf,
+        plan: &VerifiedHardwarePlan,
+        receipts: &[HardwareBuildReceipt],
+    ) -> Result<Vec<crate::binary::BinaryInstallReceipt>, HardwareError> {
+        self.install_plan_set_to_root(state, target, std::slice::from_ref(plan), receipts)
+    }
+
+    /// Install the union of several already-verified device plans.  Duplicate
+    /// package intents are intentionally coalesced, while conflicting digests
+    /// fail before any target mutation.
+    pub fn install_plan_set_to_root(
+        &self,
+        state: PathBuf,
+        target: PathBuf,
+        plans: &[VerifiedHardwarePlan],
+        receipts: &[HardwareBuildReceipt],
+    ) -> Result<Vec<crate::binary::BinaryInstallReceipt>, HardwareError> {
+        let mut intents = std::collections::BTreeMap::new();
+        for plan in plans {
+            for intent in &plan.plan.package {
+                let key = (intent.name.clone(), intent.version.clone());
+                if let Some(previous) = intents.insert(key, intent) {
+                    if previous.metadata_sha256 != intent.metadata_sha256
+                        || previous.artifact_sha256 != intent.artifact_sha256
+                        || previous.source_lock_sha256 != intent.source_lock_sha256
+                    {
+                        return Err(HardwareError::InvalidPlan(format!(
+                            "conflicting package intents across hardware plans: {}",
+                            intent.name
+                        )));
+                    }
+                }
+            }
+        }
+        if receipts.len() != intents.len() {
+            return Err(HardwareError::State(
+                "hardware receipt count differs from the verified plan set".into(),
+            ));
+        }
+        let receipts = receipts
+            .iter()
+            .map(|receipt| ((receipt.package.clone(), receipt.version.clone()), receipt))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if receipts.len() != intents.len() {
+            return Err(HardwareError::State(
+                "hardware receipts contain duplicate package identities".into(),
+            ));
+        }
+        let store = crate::binary::BinaryInstallStore::open(state, target)?;
+        let mut installed = Vec::with_capacity(intents.len());
+        for (key, intent) in intents {
+            let receipt = receipts.get(&key).ok_or_else(|| {
+                HardwareError::State(format!("missing hardware receipt: {}", intent.name))
+            })?;
+            let payload = self.payload_from_receipt(intent, receipt)?;
+            match store.install_payload(&payload, &receipt.artifact_sha256, false) {
+                Ok(result) => installed.push(result),
+                Err(error) => {
+                    for previous in installed.iter().rev() {
+                        let _ = store.remove(&previous.package);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(installed)
+    }
+
+    fn payload_from_receipt(
+        &self,
+        intent: &CorinthIntent,
+        receipt: &HardwareBuildReceipt,
+    ) -> Result<crate::binary::BinaryPayload, HardwareError> {
+        if receipt.package != intent.name
+            || receipt.version != intent.version
+            || receipt.metadata_sha256 != intent.metadata_sha256
+            || receipt.source_lock_sha256 != intent.source_lock_sha256
+            || receipt.artifact_sha256 != intent.artifact_sha256
+        {
+            return Err(HardwareError::InvalidPlan(format!(
+                "hardware receipt does not match intent: {}",
+                intent.name
+            )));
+        }
+        let package_root = self.artifact_root.join(format!(
+            "{}-{}-{}",
+            receipt.package, receipt.version, receipt.release
+        ));
+        let mut files = Vec::with_capacity(receipt.outputs.len());
+        let mut seen = BTreeSet::new();
+        for output in &receipt.outputs {
+            let relative = output
+                .strip_prefix(&package_root)
+                .map_err(|_| HardwareError::OutputRejected(output.display().to_string()))?;
+            let relative = safe_relative_path(
+                relative
+                    .to_str()
+                    .ok_or_else(|| HardwareError::OutputRejected(output.display().to_string()))?,
+            )?;
+            if !seen.insert(relative.to_string_lossy().into_owned()) {
+                return Err(HardwareError::OutputRejected(
+                    relative.display().to_string(),
+                ));
+            }
+            let metadata = fs::symlink_metadata(output)
+                .map_err(|_| HardwareError::OutputRejected(output.display().to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(HardwareError::OutputRejected(output.display().to_string()));
+            }
+            let bytes = read_bounded(output, MAX_OUTPUT_BYTES)
+                .map_err(|error| HardwareError::OutputRejected(error.to_string()))?;
+            files.push(crate::binary::BinaryPayloadFile {
+                path: relative.to_string_lossy().into_owned(),
+                mode: metadata.permissions().mode() & 0o7777,
+                bytes,
+            });
+        }
+        if files.is_empty() {
+            return Err(HardwareError::OutputRejected(intent.name.clone()));
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(crate::binary::BinaryPayload {
+            package: receipt.package.clone(),
+            version: receipt.version.clone(),
+            release: receipt.release,
+            metadata_sha256: receipt.metadata_sha256.clone(),
+            source_lock_sha256: receipt.source_lock_sha256.clone(),
+            files,
+        })
     }
 
     /// Pin and cache the Arach-Packages recipe repository itself.  GitHub is
@@ -944,14 +1112,14 @@ impl HardwareProvisioner {
             return Err(HardwareError::OutputRejected("@install-tree".into()));
         }
         let mut entries = Vec::new();
-        collect_install_files(&install_root, &install_root, &mut entries)?;
+        collect_install_files_with_modes(&install_root, &install_root, &mut entries)?;
         if entries.is_empty() {
             return Err(HardwareError::OutputRejected("@install-tree".into()));
         }
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         let mut digest = Sha256::new();
         let mut total = 0_u64;
-        for (relative, bytes) in &entries {
+        for (relative, bytes, _) in &entries {
             total = total
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| HardwareError::OutputRejected(relative.clone()))?;
@@ -988,9 +1156,9 @@ impl HardwareProvisioner {
         }
         fs::create_dir_all(&destination)?;
         let mut published = Vec::with_capacity(entries.len());
-        for (relative, bytes) in entries {
+        for (relative, bytes, mode) in entries {
             let target = destination.join(safe_relative_path(&relative)?);
-            atomic_write(&target, &bytes)?;
+            atomic_write_mode(&target, &bytes, mode)?;
             published.push(target);
         }
         Ok((intent.artifact_sha256.clone(), published))
@@ -1070,6 +1238,13 @@ fn validate_recipe(
             ));
         }
     } else {
+        if matches!(intent.scope, PackageScope::Driver | PackageScope::Firmware)
+            && recipe.build.outputs.as_slice() != ["@install-tree"]
+        {
+            return Err(HardwareError::InvalidRecipe(
+                "driver and firmware recipes must publish @install-tree".into(),
+            ));
+        }
         for output in &recipe.build.outputs {
             safe_relative_path(output)?;
         }
@@ -1402,6 +1577,7 @@ fn run_cosmic_phase(
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_install_files(
     root: &Path,
     directory: &Path,
@@ -1427,6 +1603,40 @@ fn collect_install_files(
                 relative.to_string(),
                 read_bounded(&path, MAX_OUTPUT_BYTES)
                     .map_err(|error| HardwareError::OutputRejected(error.to_string()))?,
+            ));
+        } else {
+            return Err(HardwareError::OutputRejected(path.display().to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn collect_install_files_with_modes(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, Vec<u8>, u32)>,
+) -> Result<(), HardwareError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(HardwareError::OutputRejected(path.display().to_string()));
+        }
+        if metadata.is_dir() {
+            collect_install_files_with_modes(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| HardwareError::OutputRejected(path.display().to_string()))?
+                .to_str()
+                .ok_or_else(|| HardwareError::OutputRejected(path.display().to_string()))?;
+            safe_relative_path(relative)?;
+            entries.push((
+                relative.to_string(),
+                read_bounded(&path, MAX_OUTPUT_BYTES)
+                    .map_err(|error| HardwareError::OutputRejected(error.to_string()))?,
+                metadata.permissions().mode() & 0o7777,
             ));
         } else {
             return Err(HardwareError::OutputRejected(path.display().to_string()));
@@ -1610,6 +1820,10 @@ fn reject_symlinks(root: &Path) -> Result<(), HardwareError> {
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), HardwareError> {
+    atomic_write_mode(path, bytes, 0o644)
+}
+
+fn atomic_write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), HardwareError> {
     let parent = path
         .parent()
         .ok_or_else(|| HardwareError::OutputRejected(path.display().to_string()))?;
@@ -1618,9 +1832,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), HardwareErro
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(mode)
         .open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
     fs::rename(temporary, path)?;
     Ok(())
 }
