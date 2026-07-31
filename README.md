@@ -64,10 +64,13 @@ live generation store.
 Binary repositories use a signed `package-index` key. A native binary can be
 installed with `--index INDEX --signature SIG --keyring KEYRING`; Corinth
 validates the index, downloads the exact HTTPS artifact, checks its size and
-SHA-256, and records the measured output atomically. Driver and firmware
-records are refused by this path unless a matching HWD plan is supplied. The
-complete index schema, CLI example, offline-cache behavior, and activation
-boundary are documented in [`docs/BINARY_REPOSITORY.md`](docs/BINARY_REPOSITORY.md).
+SHA-256, and records the measured output atomically. Supplying `--root`
+decodes the signed `ARCPKG01` payload, verifies every file, and performs a
+rollback-aware live-root install/update/remove; omitting it is an explicit
+image-builder staging mode. Driver and firmware records are refused by this
+path unless a matching HWD plan is supplied. The complete index schema,
+payload format, offline-cache behavior, and generation boundary are documented
+in [`docs/BINARY_REPOSITORY.md`](docs/BINARY_REPOSITORY.md).
 
 The `arch_import` module parses static PKGBUILD assignments without sourcing
 shell. It emits a canonical recipe only when a target policy supplies explicit

@@ -80,7 +80,7 @@ mod host_cli {
     use corinth::arch_import::{
         build_recipe, parse_pkgbuild, parse_target_policy, target_profile_for_package,
     };
-    use corinth::binary::{BinaryProvisioner, verify_binary_index};
+    use corinth::binary::{BinaryInstallStore, BinaryProvisioner, verify_binary_index};
     use corinth::hardware::{HardwareError, HardwareProvisioner, HostPackageStore, verify_plan};
 
     pub fn run() -> Result<(), String> {
@@ -96,6 +96,7 @@ mod host_cli {
         let mut work = None;
         let mut artifacts = None;
         let mut state = None;
+        let mut root = None;
         let mut pkgbuild = None;
         let mut target = None;
         let mut target_signature = None;
@@ -119,6 +120,7 @@ mod host_cli {
                 "--work" => work = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--artifacts" => artifacts = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--state" => state = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--root" => root = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--pkgbuild" => pkgbuild = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--target" => target = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--target-signature" => {
@@ -162,13 +164,21 @@ mod host_cli {
 
         let artifacts = artifacts.ok_or_else(usage)?;
         let state = state.ok_or_else(usage)?;
-        let store = HostPackageStore::open(state, artifacts.clone()).map_err(render)?;
+        let store = HostPackageStore::open(state.clone(), artifacts.clone()).map_err(render)?;
 
         match verb.as_str() {
             "remove" => {
                 let package = package.ok_or_else(usage)?;
-                store.remove(&package).map_err(render)?;
-                println!("removed {package}");
+                if let Some(root) = root {
+                    BinaryInstallStore::open(state, root)
+                        .map_err(render)?
+                        .remove(&package)
+                        .map_err(render)?;
+                    println!("removed {package} from target root");
+                } else {
+                    store.remove(&package).map_err(render)?;
+                    println!("removed {package} from staged artifacts");
+                }
             }
             "install" | "update" => {
                 if let Some(index_path) = index {
@@ -196,20 +206,40 @@ mod host_cli {
                     }
                     let mut fetcher = BinaryProvisioner::new(artifacts.clone()).map_err(render)?;
                     fetcher.allow_network = allow_network;
-                    let receipt = fetcher.fetch(&verified, &package, None).map_err(render)?;
-                    if verb == "update" {
-                        store
-                            .update(std::slice::from_ref(&receipt))
-                            .map_err(render)?;
+                    if let Some(root) = root {
+                        let receipt = if verb == "update" {
+                            fetcher
+                                .update_to_root(state, root, &verified, &package, None)
+                                .map_err(render)?
+                        } else {
+                            fetcher
+                                .install_to_root(state, root, &verified, &package, None)
+                                .map_err(render)?
+                        };
+                        println!(
+                            "{} {}-{} installed={} files={}",
+                            verb,
+                            receipt.package,
+                            receipt.release,
+                            receipt.artifact_sha256,
+                            receipt.files.len()
+                        );
                     } else {
-                        store
-                            .install(std::slice::from_ref(&receipt))
-                            .map_err(render)?;
+                        let receipt = fetcher.fetch(&verified, &package, None).map_err(render)?;
+                        if verb == "update" {
+                            store
+                                .update(std::slice::from_ref(&receipt))
+                                .map_err(render)?;
+                        } else {
+                            store
+                                .install(std::slice::from_ref(&receipt))
+                                .map_err(render)?;
+                        }
+                        println!(
+                            "{} {}-{} staged artifact={}",
+                            verb, receipt.package, receipt.release, receipt.artifact_sha256
+                        );
                     }
-                    println!(
-                        "{} {}-{} artifact={}",
-                        verb, receipt.package, receipt.release, receipt.artifact_sha256
-                    );
                     return Ok(());
                 }
                 let work = work.ok_or_else(usage)?;
@@ -274,7 +304,7 @@ mod host_cli {
     }
 
     fn usage() -> String {
-        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR\n       corinth import-pkgbuild --pkgbuild PKGBUILD --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE".into()
+        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild --pkgbuild PKGBUILD --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE".into()
     }
 
     fn write_recipe_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
