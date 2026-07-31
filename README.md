@@ -96,6 +96,26 @@ source-lock digests needed for the signed Arach package intent. The generated
 recipe is not an install authorization by itself; the normal Arach-HWD plan,
 repository authority, and measured artifact gates still apply.
 
+For unattended recipe discovery, Corinth can fetch an official packaging Git
+repository at one exact commit and read a PKGBUILD below that checkout:
+
+```text
+corinth import-pkgbuild \
+  --pkgbuild-git https://github.com/archlinux/packaging/packages/example.git \
+  0123456789abcdef0123456789abcdef01234567 PKGBUILD \
+  --target TARGET.toml \
+  --target-signature TARGET.toml.sig \
+  --keyring /etc/arach/hwd/keys.toml \
+  --work /var/cache/corinth/import \
+  --output recipes/generated/example.toml \
+  --allow-network
+```
+
+The revision must be a 40-hex Git commit and the selected path must remain
+inside the checkout; symlink traversal and parent components are rejected.
+`--allow-network` is explicit, and the fetched repository is only source
+material—the detached HWD policy still decides how this machine may build it.
+
 ## External recipe sources
 
 Corinth should import, rather than execute unchanged, the large ecosystems

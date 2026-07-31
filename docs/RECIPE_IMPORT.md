@@ -58,6 +58,31 @@ or install the recipe. The generated recipe remains subject to the same
 sandbox, command allow-list, output measurement, binary-index, and rollback
 checks as native recipes.
 
+The same conversion can fetch a pinned upstream packaging repository. The URL
+and revision are passed through Corinth's locked Git source acquisition, and
+the final argument is a path relative to the checkout:
+
+```sh
+cargo run --locked --features host-store -- \
+  import-pkgbuild \
+  --pkgbuild-git \
+    https://github.com/archlinux/packaging/packages/example.git \
+    0123456789abcdef0123456789abcdef01234567 \
+    PKGBUILD \
+  --target TARGET.toml \
+  --target-signature TARGET.toml.sig \
+  --keyring /etc/arach/hwd/keys.toml \
+  --work /var/cache/corinth/import \
+  --output generated/example.toml \
+  --allow-network
+```
+
+Only HTTPS URLs and full 40-hex revisions are accepted. Corinth rejects an
+absolute path, `..`, empty path components, symlinks in any component, and
+PKGBUILDs larger than the importer bound. This makes repository discovery
+convenient without allowing a remote tree to read or replace unrelated host
+files.
+
 Unsupported or unsafe input fails closed: dynamic assignments, split package
 functions, shell substitutions, unpinned Git branches, missing archive
 checksums, unsafe output paths, and arbitrary COSMIC `just` commands are not

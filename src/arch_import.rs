@@ -13,6 +13,8 @@ use alloc::{
     vec::Vec,
 };
 use std::fmt;
+use std::fs;
+use std::path::{Component, Path};
 
 use serde::Deserialize;
 
@@ -115,6 +117,7 @@ pub enum ArchImportError {
     ArchitectureMismatch(String),
     TargetInvalid(String),
     TargetPackageMismatch { expected: String, actual: String },
+    InvalidRepositoryPath(String),
     RecipeSerialization(String),
 }
 
@@ -182,6 +185,61 @@ pub fn parse_target_policy(bytes: &[u8]) -> Result<RecipeTargetPolicy, ArchImpor
         ));
     }
     Ok(policy)
+}
+
+/// Read a PKGBUILD only when it is a bounded, regular file.  In particular,
+/// do not follow a caller-supplied symlink: the remote importer must not turn
+/// a repository checkout into an arbitrary host-file reader.
+pub fn read_pkgbuild_file(path: &Path) -> Result<Vec<u8>, ArchImportError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| ArchImportError::InvalidRepositoryPath(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(ArchImportError::InvalidRepositoryPath(
+            "PKGBUILD must be a regular file".into(),
+        ));
+    }
+    if metadata.len() > MAX_PKGBUILD_BYTES as u64 {
+        return Err(ArchImportError::TooLarge);
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| ArchImportError::InvalidRepositoryPath(error.to_string()))?;
+    if bytes.len() > MAX_PKGBUILD_BYTES {
+        return Err(ArchImportError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Resolve a PKGBUILD path inside a pinned repository without following a
+/// symlink at any path component.  The caller still has to authenticate the
+/// repository revision; this function only enforces containment and bounds.
+pub fn read_repository_pkgbuild(
+    repository: &Path,
+    relative: &Path,
+) -> Result<Vec<u8>, ArchImportError> {
+    let mut path = repository.to_path_buf();
+    let mut components = 0usize;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(ArchImportError::InvalidRepositoryPath(
+                "PKGBUILD path must be relative and contain only normal components".into(),
+            ));
+        };
+        components = components.saturating_add(1);
+        path.push(name);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| ArchImportError::InvalidRepositoryPath(error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArchImportError::InvalidRepositoryPath(
+                "PKGBUILD path cannot traverse symlinks".into(),
+            ));
+        }
+    }
+    if components == 0 {
+        return Err(ArchImportError::InvalidRepositoryPath(
+            "PKGBUILD path is empty".into(),
+        ));
+    }
+    read_pkgbuild_file(&path)
 }
 
 /// Convert a validated policy into the target profile used by the recipe
@@ -856,6 +914,23 @@ reproducible = true
         assert!(matches!(
             parse_pkgbuild(unpinned.as_bytes()),
             Err(ArchImportError::UnpinnedGit(_))
+        ));
+    }
+
+    #[test]
+    fn repository_pkgbuild_paths_are_contained() {
+        let root = Path::new("/tmp/checked-out-repository");
+        assert!(matches!(
+            read_repository_pkgbuild(root, Path::new("../PKGBUILD")),
+            Err(ArchImportError::InvalidRepositoryPath(_))
+        ));
+        assert!(matches!(
+            read_repository_pkgbuild(root, Path::new("/etc/passwd")),
+            Err(ArchImportError::InvalidRepositoryPath(_))
+        ));
+        assert!(matches!(
+            read_repository_pkgbuild(root, Path::new("")),
+            Err(ArchImportError::InvalidRepositoryPath(_))
         ));
     }
 

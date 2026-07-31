@@ -78,7 +78,8 @@ mod host_cli {
     use arach_hwd::plan::{PlanSet, ProvisionPlan};
     use arach_hwd::signature::Keyring;
     use corinth::arch_import::{
-        build_recipe, parse_pkgbuild, parse_target_policy, target_profile_for_package,
+        build_recipe, parse_pkgbuild, parse_target_policy, read_pkgbuild_file,
+        read_repository_pkgbuild, target_profile_for_package,
     };
     use corinth::binary::{BinaryInstallStore, BinaryProvisioner, verify_binary_index};
     use corinth::hardware::{HardwareError, HardwareProvisioner, HostPackageStore, verify_plan};
@@ -98,6 +99,7 @@ mod host_cli {
         let mut state = None;
         let mut root = None;
         let mut pkgbuild = None;
+        let mut pkgbuild_git = None;
         let mut target = None;
         let mut target_signature = None;
         let mut output = None;
@@ -122,6 +124,12 @@ mod host_cli {
                 "--state" => state = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--root" => root = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--pkgbuild" => pkgbuild = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--pkgbuild-git" => {
+                    let url = args.next().ok_or_else(usage)?;
+                    let revision = args.next().ok_or_else(usage)?;
+                    let path = PathBuf::from(args.next().ok_or_else(usage)?);
+                    pkgbuild_git = Some((url, revision, path));
+                }
                 "--target" => target = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--target-signature" => {
                     target_signature = Some(PathBuf::from(args.next().ok_or_else(usage)?))
@@ -136,12 +144,32 @@ mod host_cli {
         }
 
         if verb == "import-pkgbuild" {
-            let pkgbuild_path = pkgbuild.ok_or_else(usage)?;
+            if pkgbuild.is_some() == pkgbuild_git.is_some() {
+                return Err(
+                    "import-pkgbuild requires exactly one of --pkgbuild or --pkgbuild-git".into(),
+                );
+            }
             let target_path = target.ok_or_else(usage)?;
             let target_signature_path = target_signature.ok_or_else(usage)?;
             let keyring_path = keyring.ok_or_else(usage)?;
             let output_path = output.ok_or_else(usage)?;
-            let pkgbuild_bytes = fs::read(pkgbuild_path).map_err(|error| error.to_string())?;
+            let pkgbuild_bytes = if let Some(path) = pkgbuild {
+                read_pkgbuild_file(&path).map_err(|error| error.to_string())?
+            } else {
+                let (url, revision, relative) = pkgbuild_git.expect("validated above");
+                let work_root = work.ok_or_else(|| {
+                    "--work is required when importing a remote PKGBUILD".to_string()
+                })?;
+                let mut fetcher =
+                    HardwareProvisioner::new(work_root.clone(), work_root.join("import-artifacts"))
+                        .map_err(render)?;
+                fetcher.allow_network = allow_network;
+                let repository = fetcher
+                    .acquire_recipe_repository(&url, &revision, false)
+                    .map_err(render)?;
+                read_repository_pkgbuild(&repository, &relative)
+                    .map_err(|error| error.to_string())?
+            };
             let metadata = parse_pkgbuild(&pkgbuild_bytes).map_err(|error| error.to_string())?;
             let target_bytes = fs::read(target_path).map_err(|error| error.to_string())?;
             let signature =
@@ -304,7 +332,7 @@ mod host_cli {
     }
 
     fn usage() -> String {
-        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild --pkgbuild PKGBUILD --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE".into()
+        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild (--pkgbuild PKGBUILD | --pkgbuild-git URL REV PATH) --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE [--work DIR] [--allow-network]".into()
     }
 
     fn write_recipe_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
