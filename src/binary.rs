@@ -118,7 +118,7 @@ impl BinaryRepositoryIndex {
         let mut names = std::collections::BTreeSet::new();
         for package in &self.packages {
             if !valid_package_name(&package.name)
-                || package.version.trim().is_empty()
+                || !valid_version(&package.version)
                 || package.release == 0
                 || !names.insert(package.name.clone())
                 || !valid_digest(&package.metadata_sha256)
@@ -195,7 +195,7 @@ pub fn encode_binary_payload(
     let metadata = decode_hex_digest(&package.metadata_sha256)?;
     let source_lock = decode_hex_digest(&package.source_lock_sha256)?;
     let name = valid_payload_identity(&package.name, "package name")?;
-    let version = valid_payload_identity(&package.version, "package version")?;
+    let version = valid_payload_version(&package.version)?;
     let name_len = name.len();
     let version_len = version.len();
     if name_len > u16::MAX as usize || version_len > u16::MAX as usize {
@@ -456,6 +456,15 @@ fn valid_payload_identity<'a>(value: &'a str, label: &str) -> Result<&'a str, Ha
         return Err(HardwareError::InvalidSource(format!(
             "invalid binary payload {label}"
         )));
+    }
+    Ok(value)
+}
+
+fn valid_payload_version(value: &str) -> Result<&str, HardwareError> {
+    if !valid_version(value) {
+        return Err(HardwareError::InvalidSource(
+            "invalid binary payload package version".into(),
+        ));
     }
     Ok(value)
 }
@@ -989,7 +998,7 @@ impl BinaryInstallStore {
 
 fn validate_payload(payload: &BinaryPayload) -> Result<(), HardwareError> {
     if !valid_package_name(&payload.package)
-        || payload.version.is_empty()
+        || !valid_version(&payload.version)
         || payload.release == 0
         || payload.files.is_empty()
         || payload.files.len() > MAX_PAYLOAD_FILES as usize
@@ -1018,7 +1027,7 @@ fn validate_payload(payload: &BinaryPayload) -> Result<(), HardwareError> {
 
 fn validate_install_receipt(receipt: &BinaryInstallReceipt) -> Result<(), HardwareError> {
     if !valid_package_name(&receipt.package)
-        || receipt.version.is_empty()
+        || !valid_version(&receipt.version)
         || receipt.release == 0
         || !valid_digest(&receipt.artifact_sha256)
         || receipt.files.is_empty()
@@ -1216,6 +1225,14 @@ fn valid_package_name(value: &str) -> bool {
         })
 }
 
+fn valid_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| !byte.is_ascii_control() && byte != b'/' && byte != b'\\')
+}
+
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1292,6 +1309,9 @@ mod tests {
         assert!(index.validate().is_err());
         index.packages.truncate(1);
         index.packages[0].url = "http://packages.example.invalid/demo.pkg".into();
+        assert!(index.validate().is_err());
+        index.packages[0].url = "https://packages.example.invalid/demo.pkg".into();
+        index.packages[0].version = "../escape".into();
         assert!(index.validate().is_err());
     }
 
