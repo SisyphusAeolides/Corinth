@@ -14,6 +14,8 @@ use alloc::{
 };
 use std::fmt;
 
+use serde::Deserialize;
+
 use crate::hardware::{
     RECIPE_FORMAT, RecipeBuild, RecipeDocument, RecipeHardware, RecipePackage, RecipePolicy,
     RecipeRuntime, RecipeSource, metadata_sha256, source_lock_sha256,
@@ -67,6 +69,32 @@ pub struct ArchTargetProfile {
     pub hardware: Option<RecipeHardware>,
 }
 
+/// Arach-HWD's signed, target-specific build decision.
+///
+/// This is deliberately a flat document so an HWD policy generator can emit
+/// it without embedding a package-manager language.  The detached signature
+/// is verified by the Corinth CLI with the `package-index` key scope before
+/// this document is accepted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeTargetPolicy {
+    pub format: u32,
+    pub package: String,
+    pub architecture: String,
+    pub scope: String,
+    pub publish_authority: String,
+    pub build_system: String,
+    pub build_commands: Vec<String>,
+    pub outputs: Vec<String>,
+    pub network: bool,
+    pub sandbox: bool,
+    pub reproducible: bool,
+    #[serde(default)]
+    pub hardware: Option<RecipeHardware>,
+}
+
+pub const TARGET_POLICY_FORMAT: u32 = 1;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportedRecipe {
     pub bytes: Vec<u8>,
@@ -86,6 +114,7 @@ pub enum ArchImportError {
     ChecksumRequired(String),
     ArchitectureMismatch(String),
     TargetInvalid(String),
+    TargetPackageMismatch { expected: String, actual: String },
     RecipeSerialization(String),
 }
 
@@ -96,6 +125,90 @@ impl fmt::Display for ArchImportError {
 }
 
 impl std::error::Error for ArchImportError {}
+
+/// Parse and validate an HWD-generated target policy without executing any
+/// package code.  Signature verification is intentionally performed by the
+/// caller before this function is used for an installation decision.
+pub fn parse_target_policy(bytes: &[u8]) -> Result<RecipeTargetPolicy, ArchImportError> {
+    if bytes.is_empty() || bytes.len() > MAX_PKGBUILD_BYTES {
+        return Err(ArchImportError::TooLarge);
+    }
+    let policy: RecipeTargetPolicy = toml::from_slice(bytes)
+        .map_err(|error| ArchImportError::TargetInvalid(error.to_string()))?;
+    if policy.format != TARGET_POLICY_FORMAT {
+        return Err(ArchImportError::TargetInvalid(
+            "unsupported target policy format".into(),
+        ));
+    }
+    if !valid_package_name(&policy.package) {
+        return Err(ArchImportError::TargetInvalid(
+            "target policy has an invalid package name".into(),
+        ));
+    }
+    if policy.architecture.trim().is_empty()
+        || !valid_scope_authority(&policy.scope, &policy.publish_authority)
+        || policy.build_commands.is_empty()
+        || policy.outputs.is_empty()
+        || !valid_build_system(&policy.build_system)
+        || policy
+            .build_commands
+            .iter()
+            .any(|command| !valid_command(command))
+    {
+        return Err(ArchImportError::TargetInvalid(
+            "target policy contains invalid build or authority fields".into(),
+        ));
+    }
+    if policy.build_system == "cosmic" {
+        if policy.build_commands != ["just build", "just install"]
+            || policy.outputs.as_slice() != ["@install-tree"]
+        {
+            return Err(ArchImportError::TargetInvalid(
+                "COSMIC target policies must use the fixed workspace adapter".into(),
+            ));
+        }
+    } else if policy
+        .outputs
+        .iter()
+        .any(|output| !valid_output_path(output))
+    {
+        return Err(ArchImportError::TargetInvalid(
+            "target policy contains an unsafe output path".into(),
+        ));
+    }
+    if matches!(policy.scope.as_str(), "driver" | "firmware") != policy.hardware.is_some() {
+        return Err(ArchImportError::TargetInvalid(
+            "hardware metadata must match driver/firmware scope".into(),
+        ));
+    }
+    Ok(policy)
+}
+
+/// Convert a validated policy into the target profile used by the recipe
+/// builder, binding it to the package parsed from the PKGBUILD.
+pub fn target_profile_for_package(
+    policy: &RecipeTargetPolicy,
+    package: &str,
+) -> Result<ArchTargetProfile, ArchImportError> {
+    if policy.package != package {
+        return Err(ArchImportError::TargetPackageMismatch {
+            expected: package.into(),
+            actual: policy.package.clone(),
+        });
+    }
+    Ok(ArchTargetProfile {
+        architecture: policy.architecture.clone(),
+        scope: policy.scope.clone(),
+        publish_authority: policy.publish_authority.clone(),
+        build_system: policy.build_system.clone(),
+        build_commands: policy.build_commands.clone(),
+        outputs: policy.outputs.clone(),
+        network: policy.network,
+        sandbox: policy.sandbox,
+        reproducible: policy.reproducible,
+        hardware: policy.hardware.clone(),
+    })
+}
 
 /// Parse static PKGBUILD assignments without executing shell code.
 pub fn parse_pkgbuild(bytes: &[u8]) -> Result<ArchPackageMetadata, ArchImportError> {
@@ -173,12 +286,7 @@ pub fn build_recipe(
             target.architecture.clone(),
         ));
     }
-    if metadata.name.is_empty()
-        || !metadata
-            .name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
+    if !valid_package_name(&metadata.name) {
         return Err(ArchImportError::InvalidField("pkgname".into()));
     }
     if target.build_commands.is_empty() || target.outputs.is_empty() {
@@ -189,6 +297,37 @@ pub fn build_recipe(
     if !valid_build_system(&target.build_system) {
         return Err(ArchImportError::TargetInvalid(
             "target policy selected an unsupported build system".into(),
+        ));
+    }
+    if !valid_scope_authority(&target.scope, &target.publish_authority) {
+        return Err(ArchImportError::TargetInvalid(
+            "target policy scope and authority do not agree".into(),
+        ));
+    }
+    if target
+        .build_commands
+        .iter()
+        .any(|command| !valid_command(command))
+    {
+        return Err(ArchImportError::TargetInvalid(
+            "target policy contains an unsafe command".into(),
+        ));
+    }
+    if target.build_system == "cosmic" {
+        if target.build_commands != ["just build", "just install"]
+            || target.outputs.as_slice() != ["@install-tree"]
+        {
+            return Err(ArchImportError::TargetInvalid(
+                "COSMIC recipes must use the fixed workspace adapter".into(),
+            ));
+        }
+    } else if target
+        .outputs
+        .iter()
+        .any(|output| !valid_output_path(output))
+    {
+        return Err(ArchImportError::TargetInvalid(
+            "target policy contains an unsafe output path".into(),
         ));
     }
     if target.scope == "driver" || target.scope == "firmware" {
@@ -500,8 +639,72 @@ fn normalize_architecture(value: &str) -> String {
 fn valid_build_system(value: &str) -> bool {
     matches!(
         value,
-        "cargo" | "c" | "fortran" | "idris2" | "agda" | "make" | "cmake" | "meson" | "custom"
+        "cargo"
+            | "c"
+            | "fortran"
+            | "idris2"
+            | "agda"
+            | "make"
+            | "cmake"
+            | "meson"
+            | "custom"
+            | "cosmic"
     )
+}
+
+fn valid_package_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_scope_authority(scope: &str, authority: &str) -> bool {
+    matches!(
+        (scope, authority),
+        ("system", "arach-native") | ("driver", "arach-hardware") | ("firmware", "arach-hardware")
+    )
+}
+
+fn valid_command(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 4096
+        && !trimmed.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'\0'
+                    | b'\n'
+                    | b'\r'
+                    | b';'
+                    | b'|'
+                    | b'&'
+                    | b'`'
+                    | b'$'
+                    | b'<'
+                    | b'>'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'*'
+                    | b'?'
+                    | b'\\'
+                    | b'\''
+                    | b'"'
+            )
+        })
+}
+
+fn valid_output_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    !value.is_empty()
+        && path.is_relative()
+        && !value.starts_with("../")
+        && value != ".."
+        && !value
+            .split('/')
+            .any(|component| component == ".." || component.is_empty())
 }
 
 fn value_complete(value: &str) -> bool {
@@ -615,6 +818,24 @@ package() {
         }
     }
 
+    fn target_policy_text(package: &str) -> String {
+        format!(
+            r#"
+format = 1
+package = "{package}"
+architecture = "x86-64"
+scope = "system"
+publish_authority = "arach-native"
+build_system = "cmake"
+build_commands = ["cmake -S . -B build", "cmake --build build"]
+outputs = ["build/demo"]
+network = false
+sandbox = true
+reproducible = true
+"#
+        )
+    }
+
     #[test]
     fn parser_reads_metadata_and_ignores_functions() {
         let parsed = parse_pkgbuild(PKGBUILD.as_bytes()).unwrap();
@@ -648,5 +869,48 @@ package() {
         assert!(text.contains("scope = \"system\""));
         assert!(text.contains("system = \"cmake\""));
         assert!(text.contains("depends = [\"cmake\"]"));
+    }
+
+    #[test]
+    fn target_policy_is_typed_and_bound_to_the_pkgbuild_name() {
+        let policy = parse_target_policy(target_policy_text("demo").as_bytes()).unwrap();
+        let selected = target_profile_for_package(&policy, "demo").unwrap();
+        assert_eq!(selected.publish_authority, "arach-native");
+        assert_eq!(selected.build_system, "cmake");
+        assert!(matches!(
+            target_profile_for_package(&policy, "other"),
+            Err(ArchImportError::TargetPackageMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn target_policy_rejects_shell_and_unsafe_outputs() {
+        let shell = target_policy_text("demo")
+            .replace("cmake --build build", "cmake --build build; rm -rf /");
+        assert!(matches!(
+            parse_target_policy(shell.as_bytes()),
+            Err(ArchImportError::TargetInvalid(_))
+        ));
+        let escape = target_policy_text("demo").replace("build/demo", "../outside");
+        assert!(matches!(
+            parse_target_policy(escape.as_bytes()),
+            Err(ArchImportError::TargetInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn cosmic_target_policy_can_only_use_the_fixed_adapter() {
+        let cosmic = target_policy_text("cosmic-desktop")
+            .replace("build_system = \"cmake\"", "build_system = \"cosmic\"")
+            .replace(
+                "build_commands = [\"cmake -S . -B build\", \"cmake --build build\"]",
+                "build_commands = [\"just build\", \"just install\"]",
+            )
+            .replace(
+                "outputs = [\"build/demo\"]",
+                "outputs = [\"@install-tree\"]",
+            );
+        let policy = parse_target_policy(cosmic.as_bytes()).unwrap();
+        assert_eq!(policy.build_system, "cosmic");
     }
 }

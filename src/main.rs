@@ -71,11 +71,15 @@ mod os_service {
 #[cfg(all(not(feature = "os-bin"), feature = "host-store"))]
 mod host_cli {
     use std::env;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::PathBuf;
 
     use arach_hwd::plan::{PlanSet, ProvisionPlan};
     use arach_hwd::signature::Keyring;
+    use corinth::arch_import::{
+        build_recipe, parse_pkgbuild, parse_target_policy, target_profile_for_package,
+    };
     use corinth::binary::{BinaryProvisioner, verify_binary_index};
     use corinth::hardware::{HardwareError, HardwareProvisioner, HostPackageStore, verify_plan};
 
@@ -92,6 +96,10 @@ mod host_cli {
         let mut work = None;
         let mut artifacts = None;
         let mut state = None;
+        let mut pkgbuild = None;
+        let mut target = None;
+        let mut target_signature = None;
+        let mut output = None;
         let mut package: Option<String> = None;
         let mut allow_network = false;
 
@@ -111,12 +119,45 @@ mod host_cli {
                 "--work" => work = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--artifacts" => artifacts = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--state" => state = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--pkgbuild" => pkgbuild = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--target" => target = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--target-signature" => {
+                    target_signature = Some(PathBuf::from(args.next().ok_or_else(usage)?))
+                }
+                "--output" => output = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
                 "--allow-network" => allow_network = true,
                 value if !value.starts_with('-') && package.is_none() => {
                     package = Some(value.into())
                 }
                 _ => return Err(usage()),
             }
+        }
+
+        if verb == "import-pkgbuild" {
+            let pkgbuild_path = pkgbuild.ok_or_else(usage)?;
+            let target_path = target.ok_or_else(usage)?;
+            let target_signature_path = target_signature.ok_or_else(usage)?;
+            let keyring_path = keyring.ok_or_else(usage)?;
+            let output_path = output.ok_or_else(usage)?;
+            let pkgbuild_bytes = fs::read(pkgbuild_path).map_err(|error| error.to_string())?;
+            let metadata = parse_pkgbuild(&pkgbuild_bytes).map_err(|error| error.to_string())?;
+            let target_bytes = fs::read(target_path).map_err(|error| error.to_string())?;
+            let signature =
+                fs::read_to_string(target_signature_path).map_err(|error| error.to_string())?;
+            let trusted = Keyring::load(&keyring_path).map_err(|error| error.to_string())?;
+            trusted
+                .verify_payload(&target_bytes, &signature, "package-index")
+                .map_err(|error| error.to_string())?;
+            let policy = parse_target_policy(&target_bytes).map_err(|error| error.to_string())?;
+            let target = target_profile_for_package(&policy, &metadata.name)
+                .map_err(|error| error.to_string())?;
+            let recipe = build_recipe(&metadata, &target).map_err(|error| error.to_string())?;
+            write_recipe_atomically(&output_path, &recipe.bytes)?;
+            println!(
+                "imported {}-{} metadata_sha256={} source_lock_sha256={}",
+                metadata.name, metadata.version, recipe.metadata_sha256, recipe.source_lock_sha256
+            );
+            return Ok(());
         }
 
         let artifacts = artifacts.ok_or_else(usage)?;
@@ -233,7 +274,39 @@ mod host_cli {
     }
 
     fn usage() -> String {
-        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR".into()
+        "usage: corinth <install|update> --plan PLAN --profile PROFILE --signature SIG --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR\n       corinth import-pkgbuild --pkgbuild PKGBUILD --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE".into()
+    }
+
+    fn write_recipe_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| "recipe output has no parent directory".to_string())?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err("recipe output must be a regular file".into());
+            }
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "recipe output has an invalid name".to_string())?;
+        let temporary = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            file.write_all(bytes).map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            fs::rename(&temporary, path).map_err(|error| error.to_string())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 }
 

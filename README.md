@@ -75,6 +75,24 @@ commands and outputs. Split packages, dynamic variables, unpinned Git sources,
 and local shell-only steps fail closed and must use a separately sandboxed
 compatibility worker.
 
+The host CLI exposes that conversion boundary directly:
+
+```text
+corinth import-pkgbuild \
+  --pkgbuild PKGBUILD \
+  --target TARGET.toml \
+  --target-signature TARGET.toml.sig \
+  --keyring /etc/arach/hwd/keys.toml \
+  --output recipes/generated/package.toml
+```
+
+`TARGET.toml` is the signed, target-specific policy emitted by the Arach-HWD
+policy pipeline. Corinth verifies it with the `package-index` key scope,
+binds its package name to the parsed PKGBUILD, and prints the metadata and
+source-lock digests needed for the signed Arach package intent. The generated
+recipe is not an install authorization by itself; the normal Arach-HWD plan,
+repository authority, and measured artifact gates still apply.
+
 ## External recipe sources
 
 Corinth should import, rather than execute unchanged, the large ecosystems
