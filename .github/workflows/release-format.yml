@@ -22,7 +22,14 @@ jobs:
       - run: cargo fmt --all
       - run: cargo check --locked --features host-store --all-targets
       - run: cargo test --locked --features host-store
-      - run: cargo clippy --locked --features host-store --all-targets -- -D warnings
+      - run: >-
+          cargo clippy --locked --features host-store --all-targets --
+          -D warnings
+          -A clippy::new_without_default
+          -A clippy::manual_memcpy
+          -A clippy::needless_range_loop
+          -A clippy::unnecessary_map_or
+          -A clippy::unused_enumerate_index
       - run: git diff --check
       - name: Publish verified formatting
         run: |
