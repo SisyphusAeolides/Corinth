@@ -410,6 +410,7 @@ pub fn build_recipe(
                 checksum: None,
                 package: None,
                 version: None,
+                destination: None,
                 submodules: false,
             },
             ArchSourceKind::Archive => RecipeSource {
@@ -419,6 +420,7 @@ pub fn build_recipe(
                 checksum: source.checksum.clone(),
                 package: None,
                 version: None,
+                destination: None,
                 submodules: false,
             },
         })
