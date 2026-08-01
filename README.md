@@ -133,8 +133,32 @@ corinth import-pkgbuild \
 
 Symlink traversal and parent components are rejected. The detached HWD policy
 still decides how the machine may build and install the imported package.
-PKGBUILD, RPM, Debian, and Nix metadata can help discover and port software;
-none of those formats is Arach installation authority by itself.
+For non-Arch ecosystems, the `corinth-import-foreign` host worker accepts only
+static, source-locked metadata:
+
+```text
+corinth-import-foreign \
+  --format <fedora|debian|alpine|gentoo> \
+  --input METADATA \
+  --source-lock SOURCES.toml \
+  --target TARGET.toml \
+  --target-signature TARGET.toml.sig \
+  --keyring /etc/arach/hwd/keys.toml \
+  --output recipes/generated/package.toml
+```
+
+Fedora spec preambles, Debian control stanzas, Alpine APKBUILD assignments,
+and Gentoo ebuild variable preambles are parsed without shell evaluation.
+Macros, phase functions, versioned or alternative dependency expressions,
+unlocked URLs, checksum drift, and unsupported architectures fail closed. The
+signed target policy still chooses the actual Arach build adapter and outputs;
+foreign metadata never becomes installation authority by itself. Packages that
+need dynamic upstream scripts belong in a separately sandboxed compatibility
+worker and are not silently admitted by these parsers.
+
+Arch PKGBUILD, Fedora, Debian, Alpine, Gentoo, CRUX, and fixed-output Nix
+metadata can therefore enter one measured recipe pipeline while retaining the
+native Arach signature, source-lock, artifact, and rollback requirements.
 
 ## Validation
 
