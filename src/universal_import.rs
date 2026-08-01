@@ -48,7 +48,7 @@ impl UniversalEcosystem {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum UniversalOrigin {
     Git {
@@ -81,7 +81,7 @@ pub enum UniversalOrigin {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniversalImportLock {
     pub format: u32,
@@ -144,6 +144,15 @@ pub fn parse_universal_import_lock(
         toml::from_slice(bytes).map_err(|error| UniversalImportError::Parse(error.to_string()))?;
     validate_universal_import_lock(&lock)?;
     Ok(lock)
+}
+
+pub fn serialize_universal_import_lock(
+    lock: &UniversalImportLock,
+) -> Result<Vec<u8>, UniversalImportError> {
+    validate_universal_import_lock(lock)?;
+    toml::to_string(lock)
+        .map(String::into_bytes)
+        .map_err(|error| UniversalImportError::Serialization(error.to_string()))
 }
 
 pub fn validate_universal_import_lock(
@@ -688,6 +697,8 @@ mod tests {
     fn serialized_lock_schema_is_strict_and_transport_is_separate() {
         let bytes = b"format = 1\necosystem = \"aur\"\npackage = \"demo\"\n\n[origin]\nkind = \"git\"\nrepository = \"https://aur.archlinux.org/demo.git\"\nrevision = \"0123456789abcdef0123456789abcdef01234567\"\nmetadata_path = \"PKGBUILD\"\nmetadata_sha256 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\nsubmodules = false\n";
         let lock = parse_universal_import_lock(bytes).unwrap();
+        let serialized = serialize_universal_import_lock(&lock).unwrap();
+        assert_eq!(parse_universal_import_lock(&serialized).unwrap(), lock);
         assert_eq!(lock.ecosystem, UniversalEcosystem::Aur);
         assert_eq!(
             git_origin(&lock).unwrap().0,

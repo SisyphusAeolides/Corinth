@@ -116,6 +116,15 @@ offline-cache behavior, and generation boundary are documented in
 
 ## External recipe imports
 
+`corinth-discover` resolves mutable Arch, AUR, CRUX, and Nix provider
+references into unsigned candidates containing only exact Git commits and
+measured metadata. Arch and AUR repository identities are derived from the
+package name; CRUX and Nix accept explicit HTTPS Git transports. Discovery
+cannot emit a recipe or install anything, and Cargo discovery remains closed
+until the complete transitive registry graph can be checksum-bound and
+materialized offline. The provider contract and examples are documented in
+[`docs/UNIVERSAL_DISCOVERY.md`](docs/UNIVERSAL_DISCOVERY.md).
+
 `corinth-ingest` is the unified unattended ingress path. It verifies a signed
 ingress lock and a separately signed target policy, resolves only an exact Git
 object or checksummed crates.io archive, remeasures upstream metadata, emits

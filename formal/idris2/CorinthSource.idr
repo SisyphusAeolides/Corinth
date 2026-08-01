@@ -9,12 +9,17 @@ public export
 data Scope = BuildInput | User | System | Driver | Firmware
 
 public export
-data IngressState = MutableCandidate | AuthenticatedLock
+data IngressState = MutableReference | ResolvedCandidate | AuthenticatedLock
 
 public export
 data Ingress : IngressState -> Type where
-  Discovered : Source -> Ingress MutableCandidate
+  Discovered : Source -> Ingress MutableReference
+  Resolved : Source -> Ingress ResolvedCandidate
   SignedLock : Source -> Ingress AuthenticatedLock
+
+public export
+data Resolves : Ingress MutableReference -> Ingress ResolvedCandidate -> Type where
+  ExactIdentity : Resolves (Discovered source) (Resolved source)
 
 public export
 data Translates : Ingress state -> Type where
@@ -23,6 +28,10 @@ data Translates : Ingress state -> Type where
 public export
 unsignedCannotTranslate : Translates (Discovered source) -> Void
 unsignedCannotTranslate value impossible
+
+public export
+resolvedCannotTranslate : Translates (Resolved source) -> Void
+resolvedCannotTranslate value impossible
 
 public export
 record Authority where

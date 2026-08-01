@@ -2403,7 +2403,7 @@ fn run_direct(
     program: &str,
     args: &[&str],
     directory: &Path,
-    network: bool,
+    _network: bool,
 ) -> Result<(), HardwareError> {
     if !matches!(program, "git" | "curl" | "tar") {
         return Err(HardwareError::CommandRejected(program.into()));
@@ -2413,8 +2413,13 @@ fn run_direct(
         .args(args)
         .current_dir(directory)
         .stdin(Stdio::null());
-    if !network {
-        command.env("GIT_CONFIG_NOSYSTEM", "1");
+    if program == "git" {
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("GIT_ALLOW_PROTOCOL", "https");
     }
     let status = command
         .status()

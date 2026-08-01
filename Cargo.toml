@@ -50,6 +50,11 @@ name = "corinth-ingest"
 path = "src/bin/corinth-ingest.rs"
 required-features = ["host-store"]
 
+[[bin]]
+name = "corinth-discover"
+path = "src/bin/corinth-discover.rs"
+required-features = ["host-store"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

@@ -14,17 +14,24 @@ data Scope : Set where
   buildInput user system driver firmware : Scope
 
 data IngressState : Set where
-  mutableCandidate authenticatedLock : IngressState
+  mutableReference resolvedCandidate authenticatedLock : IngressState
 
 data Ingress : IngressState → Set where
-  discovered : Source → Ingress mutableCandidate
+  discovered : Source → Ingress mutableReference
+  resolved : Source → Ingress resolvedCandidate
   signedLock : Source → Ingress authenticatedLock
+
+data Resolves : Ingress mutableReference → Ingress resolvedCandidate → Set where
+  exactIdentity : ∀ {source} → Resolves (discovered source) (resolved source)
 
 data Translates : ∀ {state} → Ingress state → Set where
   canonicalize : ∀ {source} → Translates (signedLock source)
 
 unsigned-cannot-translate : ∀ {source} → Translates (discovered source) → Empty
 unsigned-cannot-translate ()
+
+resolved-cannot-translate : ∀ {source} → Translates (resolved source) → Empty
+resolved-cannot-translate ()
 
 data Admitted : Source -> Scope -> Set where
   cargoBuild : Admitted cratesIo buildInput
