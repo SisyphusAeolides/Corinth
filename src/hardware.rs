@@ -2437,21 +2437,39 @@ mod tests {
             "sh",
             &[
                 "-c",
-                "printf sealed > sandbox-write && test ! -e /etc/shadow && test \"$HOME\" = /tmp/corinth-home && test \"$CARGO_NET_OFFLINE\" = true",
+                "printf sealed > sandbox-write && test ! -e /etc/shadow && test \"$HOME\" = /tmp/corinth-home && test -z \"${CARGO_NET_OFFLINE:-}\"",
             ],
             &root,
-            false,
+            true,
             &[],
         )
         .unwrap();
         assert!(status.success());
         assert_eq!(fs::read(root.join("sandbox-write")).unwrap(), b"sealed");
         assert!(
-            run_sandboxed("cargo", &["--version"], &root, false, &[])
+            run_sandboxed("cargo", &["--version"], &root, true, &[])
                 .unwrap()
                 .success()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_boundary_never_retains_the_callers_network_namespace() {
+        let root = std::env::temp_dir();
+        let mut offline = Command::new(SANDBOX_PROGRAM);
+        append_sandbox_boundary(&mut offline, &root, false).unwrap();
+        let offline = offline
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(offline.iter().any(|argument| argument == "--unshare-all"));
+        assert!(!offline.iter().any(|argument| argument == "--share-net"));
+
+        let mut online = Command::new(SANDBOX_PROGRAM);
+        append_sandbox_boundary(&mut online, &root, true).unwrap();
+        assert!(online.get_args().any(|argument| argument == "--share-net"));
     }
 
     #[test]
