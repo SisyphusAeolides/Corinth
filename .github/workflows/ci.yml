@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y gfortran
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap gfortran
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy

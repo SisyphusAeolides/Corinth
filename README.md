@@ -53,9 +53,13 @@ digests agree.
 
 Recipes use one locked source plus an explicit output list. Ordinary recipes do
 not invoke a shell; commands are tokenized, allow-listed, and executed with
-reproducibility and network policy applied. The special `cosmic` adapter is a
-fixed compatibility boundary for the pinned upstream `justfile` and accepts
-only its build and install phases.
+reproducibility and network policy applied. Every admitted build phase runs in
+a fresh bubblewrap boundary with a private process/session/IPC/UTS namespace,
+no capabilities, an isolated temporary HOME, read-only toolchains and caches,
+and only its measured source tree writable. Offline recipes also receive an
+isolated network namespace. Corinth fails closed when this boundary is absent
+or mutable. The special `cosmic` adapter is a fixed compatibility boundary for
+the pinned upstream `justfile` and accepts only its build and install phases.
 
 | Recipe system | Supported toolchain examples | Source inputs |
 | --- | --- | --- |

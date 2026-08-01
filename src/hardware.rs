@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -30,6 +30,7 @@ pub const RECIPE_FORMAT: u32 = 1;
 pub const MAX_RECIPE_BYTES: usize = 128 * 1024;
 pub const MAX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub const TARGET_ARCH: &str = "x86-64";
+const SANDBOX_PROGRAM: &str = "/usr/bin/bwrap";
 
 /// Digest helpers are public so the Arach-Packages forge and HWD profile
 /// generator can compute the exact values that cross the plan boundary.
@@ -1660,20 +1661,7 @@ fn run_kernel_cargo(
     arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Result<(), HardwareError> {
-    let mut command = Command::new("cargo");
-    command
-        .args(arguments)
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .env("SOURCE_DATE_EPOCH", "1")
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    let status = command
-        .status()
-        .map_err(|error| HardwareError::CommandFailed(error.to_string()))?;
+    let status = run_sandboxed("cargo", arguments, directory, false, environment)?;
     if status.success() {
         Ok(())
     } else {
@@ -1705,19 +1693,7 @@ fn run_build_command(
     if argv.is_empty() || !allowed_program(system, argv[0]) {
         return Err(HardwareError::CommandRejected(command.into()));
     }
-    let mut child = Command::new(argv[0]);
-    child
-        .args(&argv[1..])
-        .current_dir(directory)
-        .stdin(Stdio::null());
-    child.env("SOURCE_DATE_EPOCH", "1");
-    if !network {
-        child.env("CARGO_NET_OFFLINE", "true");
-        child.env("GIT_CONFIG_NOSYSTEM", "1");
-    }
-    let status = child
-        .status()
-        .map_err(|error| HardwareError::CommandFailed(error.to_string()))?;
+    let status = run_sandboxed(argv[0], &argv[1..], directory, network, &[])?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(command.into()));
     }
@@ -1787,19 +1763,7 @@ fn run_cosmic_phase(
     arguments: &[&str],
     network: bool,
 ) -> Result<(), HardwareError> {
-    let mut command = Command::new("just");
-    command
-        .args(arguments)
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .env("SOURCE_DATE_EPOCH", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
-    if !network {
-        command.env("CARGO_NET_OFFLINE", "true");
-    }
-    let status = command
-        .status()
-        .map_err(|error| HardwareError::CommandFailed(error.to_string()))?;
+    let status = run_sandboxed("just", arguments, directory, network, &[])?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(format!(
             "just {} failed",
@@ -1807,6 +1771,234 @@ fn run_cosmic_phase(
         )));
     }
     Ok(())
+}
+
+/// Executes an admitted build phase inside a fresh bubblewrap boundary.
+///
+/// The source tree is the only persistent writable mount. Toolchains and
+/// package caches are read-only, HOME and temporary state are private, all
+/// capabilities are dropped, and offline recipes receive a distinct network
+/// namespace. A missing or mutable sandbox executable is a hard failure.
+fn run_sandboxed(
+    program: &str,
+    arguments: &[&str],
+    directory: &Path,
+    network: bool,
+    environment: &[(&str, &str)],
+) -> Result<std::process::ExitStatus, HardwareError> {
+    validate_sandbox_backend()?;
+    let source = fs::canonicalize(directory)
+        .map_err(|error| HardwareError::CommandRejected(error.to_string()))?;
+    let metadata = fs::symlink_metadata(&source)
+        .map_err(|error| HardwareError::CommandRejected(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !source.is_absolute() {
+        return Err(HardwareError::CommandRejected(
+            "sandbox source must be an absolute real directory".into(),
+        ));
+    }
+
+    let mut command = Command::new(SANDBOX_PROGRAM);
+    append_sandbox_boundary(&mut command, &source, network)?;
+    for (name, value) in environment {
+        if !valid_environment_name(name) || value.contains('\0') {
+            return Err(HardwareError::CommandRejected(format!(
+                "invalid sandbox environment key: {name}"
+            )));
+        }
+        command.args(["--setenv", name, value]);
+    }
+    command
+        .arg("--")
+        .arg(program)
+        .args(arguments)
+        .stdin(Stdio::null());
+    command
+        .status()
+        .map_err(|error| HardwareError::CommandFailed(error.to_string()))
+}
+
+fn validate_sandbox_backend() -> Result<(), HardwareError> {
+    let metadata = fs::symlink_metadata(SANDBOX_PROGRAM)
+        .map_err(|_| HardwareError::CommandRejected("bubblewrap sandbox is unavailable".into()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err(HardwareError::CommandRejected(
+            "bubblewrap sandbox is not a trusted executable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn append_sandbox_boundary(
+    command: &mut Command,
+    source: &Path,
+    network: bool,
+) -> Result<(), HardwareError> {
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--cap-drop",
+        "ALL",
+        "--clearenv",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--symlink",
+        "usr/sbin",
+        "/sbin",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        "/run",
+        "--dir",
+        "/var",
+        "--dir",
+        "/home",
+        "--dir",
+        "/etc",
+        "--dir",
+        "/tmp/corinth-home",
+        "--dir",
+        "/tmp/corinth-cargo",
+        "--hostname",
+        "corinth-build",
+    ]);
+    if network {
+        command.arg("--share-net");
+    }
+
+    for path in [
+        "/etc/alternatives",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/resolv.conf",
+        "/etc/ssl",
+        "/etc/pki",
+    ] {
+        if fs::symlink_metadata(path).is_ok() {
+            command.args(["--ro-bind", path, path]);
+        }
+    }
+
+    let mut tool_roots = BTreeSet::new();
+    let mut sandbox_path = vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")];
+    for name in ["RUSTUP_HOME", "IDRIS2_PREFIX", "AGDA_DIR"] {
+        if let Some(root) = absolute_environment_directory(name) {
+            tool_roots.insert(root);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for relative in [".rustup", ".idris2", ".agda"] {
+            let root = home.join(relative);
+            if fs::symlink_metadata(&root)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                tool_roots.insert(root);
+            }
+        }
+    }
+    if let Some(cargo_home) = cargo_home() {
+        let bin = cargo_home.join("bin");
+        if fs::symlink_metadata(&bin)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            sandbox_path.insert(0, bin.clone());
+            tool_roots.insert(bin);
+        }
+    }
+    let sandbox_path = std::env::join_paths(&sandbox_path)
+        .map_err(|error| HardwareError::CommandRejected(error.to_string()))?;
+    let sandbox_path = sandbox_path
+        .to_str()
+        .ok_or_else(|| HardwareError::CommandRejected("sandbox PATH is not UTF-8".into()))?;
+    for root in tool_roots {
+        let root = path_str(&root)?;
+        command.args(["--ro-bind", root, root]);
+    }
+
+    if let Some(cargo_home) = cargo_home() {
+        for child in ["registry", "git"] {
+            let cache = cargo_home.join(child);
+            if fs::symlink_metadata(&cache)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                let destination = format!("/tmp/corinth-cargo/{child}");
+                command.args(["--ro-bind", path_str(&cache)?, &destination]);
+            }
+        }
+    }
+
+    command
+        .args(["--bind", path_str(source)?, path_str(source)?])
+        .args(["--chdir", path_str(source)?])
+        .args(["--setenv", "HOME", "/tmp/corinth-home"])
+        .args(["--setenv", "CARGO_HOME", "/tmp/corinth-cargo"])
+        .args(["--setenv", "PATH", sandbox_path])
+        .args(["--setenv", "LANG", "C.UTF-8"])
+        .args(["--setenv", "LC_ALL", "C.UTF-8"])
+        .args(["--setenv", "TZ", "UTC"])
+        .args(["--setenv", "SOURCE_DATE_EPOCH", "1"])
+        .args(["--setenv", "GIT_CONFIG_NOSYSTEM", "1"])
+        .args(["--setenv", "RUSTUP_NO_UPDATE_CHECK", "1"]);
+    if !network {
+        command.args(["--setenv", "CARGO_NET_OFFLINE", "true"]);
+    }
+    if let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") {
+        command.args(["--setenv", "RUSTUP_TOOLCHAIN", &toolchain]);
+    }
+    if let Some(rustup_home) = absolute_environment_directory("RUSTUP_HOME").or_else(|| {
+        let path = PathBuf::from(std::env::var_os("HOME")?).join(".rustup");
+        fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .then_some(path)
+    }) {
+        command.args(["--setenv", "RUSTUP_HOME", path_str(&rustup_home)?]);
+    }
+    Ok(())
+}
+
+fn absolute_environment_directory(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    (path.is_absolute()
+        && fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink()))
+    .then_some(path)
+}
+
+fn cargo_home() -> Option<PathBuf> {
+    absolute_environment_directory("CARGO_HOME").or_else(|| {
+        let path = PathBuf::from(std::env::var_os("HOME")?).join(".cargo");
+        fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .then_some(path)
+    })
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[cfg(test)]
@@ -2230,6 +2422,36 @@ mod tests {
         assert!(parse_command("cargo build; rm -rf /").is_err());
         assert!(parse_command("sh -c cargo").is_ok());
         assert!(!allowed_program("cargo", "sh"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_process_receives_only_the_private_writable_boundary() {
+        let root =
+            std::env::temp_dir().join(format!("corinth-build-sandbox-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let status = run_sandboxed(
+            "sh",
+            &[
+                "-c",
+                "printf sealed > sandbox-write && test ! -e /etc/shadow && test \"$HOME\" = /tmp/corinth-home && test \"$CARGO_NET_OFFLINE\" = true",
+            ],
+            &root,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read(root.join("sandbox-write")).unwrap(), b"sealed");
+        assert!(
+            run_sandboxed("cargo", &["--version"], &root, false, &[])
+                .unwrap()
+                .success()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
