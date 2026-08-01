@@ -3,36 +3,59 @@
 Corinth is the transactional source and binary package manager for Arach OS.
 It stages canonical package-state changes, validates locked source identities,
 measures artifacts, commits complete generations atomically, and retains a
-bounded rollback history. The host-store bridge can also consume an
-Arach-HWD signed provisioning plan, fetch its exact source revision, run a
-recipe, measure every declared output, and publish the result only after all
-three plan digests agree.
+bounded rollback history.
 
-Repository authority is typed. crates.io sparse packages and Git revisions are
-accepted as locked build inputs; they cannot directly authorize system drivers.
-System packages require signed Arach native metadata and artifacts, while
-driver and firmware transactions require the separate signed Arach hardware
-index consumed by Arach-HWD.
+Repository authority is typed. crates.io sparse packages, archives, and Git
+revisions are accepted as locked build inputs; they cannot directly authorize a
+system package or driver. System packages require signed Arach native metadata
+and artifacts. Driver and firmware transactions additionally require a signed
+Arach-HWD provisioning plan and compatible Driver ABI.
 
 Rust implements the resolver, source gates, package ledger, native service,
-and host recipe executor. Fortran provides build scheduling telemetry that
-cannot grant trust. Idris 2 makes source selection total, and Agda proves that
-crates.io and raw Git sources cannot acquire system-driver authority.
+host recipe executor, and generation store. Fortran provides build scheduling
+telemetry that cannot grant trust. Idris 2 makes source selection total, and
+Agda proves that raw build sources cannot acquire system-driver authority.
+
+## Current Arach OS integration
+
+The current Arach OS component lock pins Corinth
+`017a20599e68c5d374890de33ea611c491e07ec6`.
+
+Arach-Packages validation fetches that exact revision and builds its declared
+native outputs rather than substituting a local checkout. Arach OS then
+materializes versioned Corinth artifacts into the signed live root and requires
+the package manager, package generation, and installer paths before publishing
+the SquashFS and UEFI ISO layout.
+
+The host-store generation codec, stale-publisher rejection, rollback checks,
+and installer transaction boundary are implemented and tested. The
+freestanding `os-bin` still keeps a capability-oriented service boundary until
+on-target artifact deployment is connected to the live generation store. The
+current release therefore qualifies exact artifact production and image
+composition; it does not yet claim a complete package transaction inside a
+booted COSMIC session.
+
+## Generation and rollback boundary
 
 The canonical generation codec and `host-store` backend provide the installer
 with durable package-state publication. Generation files are immutable and
-content-addressed; the active pointer is replaced only after the generation is
-written and synchronized. Every image names its exact parent, stale publishers
-are rejected, and rollback requires the current generation digest before the
-parent pointer can be restored.
+content-addressed. The active pointer is replaced only after the generation is
+written and synchronized. Every generation names its exact parent, stale
+publishers are rejected, and rollback requires the current generation digest
+before the parent pointer can be restored.
+
+The host-store bridge can consume an Arach-HWD signed provisioning plan, fetch
+its exact source revision, run the selected recipe, measure every declared
+output, and publish only after the plan's artifact, metadata, and source-lock
+digests agree.
 
 ## Recipe build matrix
 
-Recipes are source-based and use one locked source plus an explicit output
-list. Ordinary recipes never invoke a shell; commands are tokenized,
-allow-listed, and run with reproducibility and network policy applied. The
-special `cosmic` adapter is a fixed compatibility boundary for the pinned
-upstream `justfile` and accepts only its build/install phases.
+Recipes use one locked source plus an explicit output list. Ordinary recipes do
+not invoke a shell; commands are tokenized, allow-listed, and executed with
+reproducibility and network policy applied. The special `cosmic` adapter is a
+fixed compatibility boundary for the pinned upstream `justfile` and accepts
+only its build and install phases.
 
 | Recipe system | Supported toolchain examples | Source inputs |
 | --- | --- | --- |
@@ -45,40 +68,44 @@ upstream `justfile` and accepts only its build/install phases.
 | `cosmic` | pinned COSMIC Epoch workspace adapter | Git with locked submodules |
 
 The source lock, recipe metadata, and measured artifact digest are independent
-checks. crates.io, Git, and local sources are build inputs; they do not grant
-system, driver, or firmware authority. System packages require Arach-native
-metadata, while drivers and firmware must arrive through an Ed25519-verified
-Arach-HWD plan with a compatible Driver ABI and health/rollback policy.
-The COSMIC adapter recursively measures its install tree and rejects symlinks
-before staging the result.
+checks. The COSMIC adapter recursively measures its install tree and rejects
+symlinks before staging the result.
+
+## Provisioning and native package APIs
 
 The host API is `hardware::verify_plan` followed by
 `HardwareProvisioner::build_verified`. With the `host-store` feature, the
-`corinth` binary exposes the same transaction boundary through
-`install`, `update`, and `remove`; `--recipes-git URL REV` accepts only a
-pinned HTTPS recipe repository and still requires the signed plan's exact
-metadata and source-lock digests. The freestanding `os-bin` keeps its
-capability-oriented service boundary until artifact deployment is bound to the
-live generation store.
+`corinth` binary exposes the same transaction boundary through `install`,
+`update`, and `remove`.
+
+`--recipes-git URL REV` accepts only a pinned HTTPS recipe repository and still
+requires the signed plan's exact metadata and source-lock digests. Network use
+is explicit and source retrieval never grants install authority.
 
 Binary repositories use a signed `package-index` key. A native binary can be
-installed with `--index INDEX --signature SIG --keyring KEYRING`; Corinth
-validates the index, downloads the exact HTTPS artifact, checks its size and
-SHA-256, and records the measured output atomically. Supplying `--root`
-decodes the signed `ARCPKG01` payload, verifies every file, and performs a
-rollback-aware live-root install/update/remove; omitting it is an explicit
-image-builder staging mode. Driver and firmware records are refused by this
-path unless a matching HWD plan is supplied. The complete index schema,
-payload format, offline-cache behavior, and generation boundary are documented
-in [`docs/BINARY_REPOSITORY.md`](docs/BINARY_REPOSITORY.md).
+installed with:
+
+```text
+corinth install --index INDEX --signature SIG --keyring KEYRING
+```
+
+Corinth validates the index, downloads or reads the exact artifact, checks its
+size and SHA-256, and records the measured output atomically. Supplying
+`--root` decodes the signed `ARCPKG01` payload, verifies every file, and performs
+a rollback-aware live-root install, update, or removal. Omitting `--root` is an
+explicit image-builder staging mode.
+
+Driver and firmware records are refused by the native package path unless a
+matching HWD plan is supplied. The complete index schema, payload format,
+offline-cache behavior, and generation boundary are documented in
+[`docs/BINARY_REPOSITORY.md`](docs/BINARY_REPOSITORY.md).
+
+## External recipe imports
 
 The `arch_import` module parses static PKGBUILD assignments without sourcing
-shell. It emits a canonical recipe only when a target policy supplies explicit
-commands and outputs. Split packages, dynamic variables, unpinned Git sources,
-and local shell-only steps fail closed and must use a separately sandboxed
-compatibility worker.
-
-The host CLI exposes that conversion boundary directly:
+shell. It emits a canonical recipe only when a signed target policy supplies
+explicit commands and outputs. Split packages, dynamic variables, unpinned Git
+sources, and local shell-only steps fail closed.
 
 ```text
 corinth import-pkgbuild \
@@ -89,15 +116,8 @@ corinth import-pkgbuild \
   --output recipes/generated/package.toml
 ```
 
-`TARGET.toml` is the signed, target-specific policy emitted by the Arach-HWD
-policy pipeline. Corinth verifies it with the `package-index` key scope,
-binds its package name to the parsed PKGBUILD, and prints the metadata and
-source-lock digests needed for the signed Arach package intent. The generated
-recipe is not an install authorization by itself; the normal Arach-HWD plan,
-repository authority, and measured artifact gates still apply.
-
-For unattended recipe discovery, Corinth can fetch an official packaging Git
-repository at one exact commit and read a PKGBUILD below that checkout:
+For unattended discovery, Corinth can fetch one official packaging repository
+at one exact 40-hex commit and read a path that remains inside the checkout:
 
 ```text
 corinth import-pkgbuild \
@@ -111,43 +131,16 @@ corinth import-pkgbuild \
   --allow-network
 ```
 
-The revision must be a 40-hex Git commit and the selected path must remain
-inside the checkout; symlink traversal and parent components are rejected.
-`--allow-network` is explicit, and the fetched repository is only source
-material—the detached HWD policy still decides how this machine may build it.
-
-## External recipe sources
-
-Corinth should import, rather than execute unchanged, the large ecosystems
-that already describe packages. The first adapter should target the official
-Arch packaging Git repositories (`archlinux/packaging/packages/*`) and the
-`pkgctl`/`makepkg` workflow:
-
-* Arch Build System `PKGBUILD` trees provide broad source coverage, but their
-  `prepare()`, `build()`, and `package()` bodies are shell programs. The
-  importer should pin the package Git commit, parse metadata and checksums,
-  and emit a canonical Corinth recipe. If the legacy body is needed, it must
-  run in a separately sandboxed compatibility worker; it must never run inside
-  the Corinth service or silently acquire Arach authority.
-* Fedora RPM spec files and Debian `debian/rules` expose useful dependency and
-  file metadata, but macros and maintainer scripts are likewise compatibility
-  inputs, never native Corinth authority.
-* Nixpkgs derivations are an excellent source of pinned hashes and dependency
-  graphs. A Nix evaluator can export a signed intermediate manifest; Corinth
-  should not embed an unrestricted Nix language evaluator in the package
-  service.
-
-The import boundary produces the same recipe, source-lock, SBOM, and artifact
-digest used by native Arach-Packages. Imported metadata can help discover and
-port software; only an Arach signature or an Arach-HWD plan can authorize a
-system, driver, or firmware transaction. This gives Corinth broad source
-coverage without pretending that a PKGBUILD, RPM spec, Debian rules file, or
-Nix expression is itself a portable, trusted package.
+Symlink traversal and parent components are rejected. The detached HWD policy
+still decides how the machine may build and install the imported package.
+PKGBUILD, RPM, Debian, and Nix metadata can help discover and port software;
+none of those formats is Arach installation authority by itself.
 
 ## Validation
 
 ```sh
 cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --features fortran-policy,host-store
 scripts/check-formal-models.sh
 ```
