@@ -12,7 +12,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap gfortran
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap cargo gfortran rustc
+      - run: |
+          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
