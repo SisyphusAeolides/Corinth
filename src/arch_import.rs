@@ -467,6 +467,7 @@ pub fn build_recipe(
             reproducible: target.reproducible,
         },
         hardware: target.hardware.clone(),
+        cargo_closure: None,
     };
     let bytes = toml::to_string(&document)
         .map_err(|error| ArchImportError::RecipeSerialization(error.to_string()))?
@@ -731,9 +732,9 @@ fn valid_build_system(value: &str) -> bool {
 
 fn valid_package_name(value: &str) -> bool {
     !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 fn valid_scope_authority(scope: &str, authority: &str) -> bool {

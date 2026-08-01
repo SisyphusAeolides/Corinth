@@ -79,12 +79,28 @@ GitHub is transport in both cases. The commit and file measurements become the
 candidate identity; the hosting account does not gain Arach publication
 authority.
 
-## Cargo closure requirement
+## Cargo closures
 
-Cargo discovery fails closed for now. Pinning the root `.crate` archive alone
-does not bind feature selection, target-specific dependencies, build
-dependencies, or the complete transitive registry graph. Cargo support becomes
-eligible for automatic discovery only when the candidate carries a complete
-resolver lock and checksum for every registry archive, and Corinth can
-materialize that closure into an offline source replacement. This prevents a
-top-level checksum from being presented as whole-build reproducibility.
+Cargo discovery requires an exact version. Corinth resolves the published
+crate in an isolated Cargo home, verifies the root `.crate` checksum, resolves
+the crate's own lock graph, fetch-verifies the graph, and records the exact
+checksum of every registry archive. It rejects Git, path, alternate-registry,
+missing-checksum, and ambiguous dependencies.
+
+```text
+corinth-discover \
+  --ecosystem cargo \
+  --package sha2 \
+  --version 0.10.9 \
+  --architecture x86-64 \
+  --work /var/cache/corinth/discovery \
+  --output /var/lib/corinth/candidates/sha2.toml \
+  --allow-network
+```
+
+After signature admission, the canonical recipe names the root crate and every
+transitive crate as independent locked sources. Corinth materializes dependency
+archives into a private directory source, writes file-level Cargo checksums,
+installs the candidate's exact `Cargo.lock`, and supplies an offline Cargo
+source replacement. Cargo target policy must disable build networking and every
+build command must use `--locked`.

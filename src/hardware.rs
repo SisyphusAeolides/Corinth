@@ -13,7 +13,7 @@ use alloc::{
     vec::Vec,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -31,7 +31,7 @@ use arach_hwd::signature::Keyring;
 use serde::{Deserialize, Serialize};
 
 pub const RECIPE_FORMAT: u32 = 1;
-pub const MAX_RECIPE_BYTES: usize = 128 * 1024;
+pub const MAX_RECIPE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub const TARGET_ARCH: &str = "x86-64";
 const SANDBOX_PROGRAM: &str = "/usr/bin/bwrap";
@@ -69,6 +69,23 @@ pub struct RecipeDocument {
     pub policy: RecipePolicy,
     #[serde(default)]
     pub hardware: Option<RecipeHardware>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_closure: Option<RecipeCargoClosure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeCargoClosure {
+    pub lock: String,
+    pub packages: Vec<RecipeCargoPackage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeCargoPackage {
+    pub name: String,
+    pub version: String,
+    pub checksum: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -867,6 +884,7 @@ impl HardwareProvisioner {
 
         let materialized_sources = kernel_materialization_sources(&recipe)?;
         let source_dir = self.materialize_sources(&materialized_sources, &source_lock)?;
+        prepare_cargo_closure(&recipe, &source_dir)?;
         if recipe.build.system == "cosmic" {
             run_cosmic_workspace(&source_dir, recipe.policy.network, compiler)?;
         } else if is_fixed_kernel_recipe(&recipe) {
@@ -1426,6 +1444,7 @@ fn validate_recipe(
             recipe.build.system.clone(),
         ));
     }
+    validate_cargo_closure(recipe)?;
     for dependency in &recipe.build.depends {
         if !valid_package_atom(dependency) {
             return Err(HardwareError::InvalidRecipe(format!(
@@ -1470,6 +1489,259 @@ fn validate_recipe(
         }
         for output in &recipe.build.outputs {
             safe_relative_path(output)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CargoLockDocument {
+    version: u32,
+    #[serde(default)]
+    package: Vec<CargoLockPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+fn validate_cargo_closure(recipe: &RecipeDocument) -> Result<(), HardwareError> {
+    let Some(closure) = &recipe.cargo_closure else {
+        if recipe
+            .source
+            .iter()
+            .any(|source| matches!(source.kind.as_str(), "crates-io" | "crates.io" | "crate"))
+        {
+            return Err(HardwareError::InvalidRecipe(
+                "crates.io recipes require a complete Cargo closure".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if recipe.build.system != "cargo"
+        || recipe.policy.network
+        || recipe.build.commands.iter().any(|command| {
+            !command
+                .split_ascii_whitespace()
+                .any(|word| word == "--locked")
+        })
+    {
+        return Err(HardwareError::InvalidRecipe(
+            "Cargo closures require offline cargo commands with --locked".into(),
+        ));
+    }
+    validate_cargo_lock_closure(
+        &closure.lock,
+        &closure.packages,
+        &recipe.package.name,
+        &recipe.package.version,
+    )?;
+    let crate_sources = recipe
+        .source
+        .iter()
+        .filter(|source| matches!(source.kind.as_str(), "crates-io" | "crates.io" | "crate"))
+        .collect::<Vec<_>>();
+    let root_sources = crate_sources
+        .iter()
+        .filter(|source| {
+            source.package.as_deref() == Some(recipe.package.name.as_str())
+                && source.version.as_deref() == Some(recipe.package.version.as_str())
+                && source.destination.is_none()
+        })
+        .count();
+    if root_sources != 1
+        || crate_sources.len() != closure.packages.len() + 1
+        || closure.packages.iter().any(|package| {
+            !crate_sources.iter().any(|source| {
+                source.package.as_deref() == Some(package.name.as_str())
+                    && source.version.as_deref() == Some(package.version.as_str())
+                    && source.checksum.as_deref() == Some(package.checksum.as_str())
+                    && source.destination.as_deref()
+                        == Some(
+                            format!(".corinth-vendor/{}-{}", package.name, package.version)
+                                .as_str(),
+                        )
+            })
+        })
+    {
+        return Err(HardwareError::InvalidRecipe(
+            "Cargo sources do not match the locked package closure".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_cargo_lock_closure(
+    lock_text: &str,
+    packages: &[RecipeCargoPackage],
+    root_name: &str,
+    root_version: &str,
+) -> Result<(), HardwareError> {
+    let lock: CargoLockDocument = toml::from_str(lock_text)
+        .map_err(|error| HardwareError::InvalidRecipe(error.to_string()))?;
+    if !(3..=4).contains(&lock.version) || lock.package.is_empty() {
+        return Err(HardwareError::InvalidRecipe(
+            "unsupported or empty Cargo lock".into(),
+        ));
+    }
+    let mut locked = Vec::new();
+    let mut root_count = 0usize;
+    for package in lock.package {
+        let Some(source) = package.source else {
+            if package.name == root_name
+                && package.version == root_version
+                && package.checksum.is_none()
+            {
+                root_count += 1;
+                continue;
+            }
+            return Err(HardwareError::InvalidRecipe(
+                "Cargo lock contains an unexpected local package".into(),
+            ));
+        };
+        if package.name == root_name && package.version == root_version {
+            return Err(HardwareError::InvalidRecipe(
+                "Cargo root appears as a registry dependency".into(),
+            ));
+        }
+        if source != "registry+https://github.com/rust-lang/crates.io-index"
+            || package
+                .dependencies
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(HardwareError::InvalidRecipe(
+                "Cargo closure contains a non-crates.io dependency".into(),
+            ));
+        }
+        let checksum = package.checksum.ok_or_else(|| {
+            HardwareError::InvalidRecipe("Cargo registry checksum is missing".into())
+        })?;
+        if !valid_package_atom_extended(&package.name)
+            || !valid_version(&package.version)
+            || !valid_digest(&checksum)
+        {
+            return Err(HardwareError::InvalidRecipe(
+                "Cargo lock identity is invalid".into(),
+            ));
+        }
+        locked.push(RecipeCargoPackage {
+            name: package.name,
+            version: package.version,
+            checksum,
+        });
+    }
+    locked.sort_by(|left, right| (&left.name, &left.version).cmp(&(&right.name, &right.version)));
+    if root_count != 1 || locked.windows(2).any(|pair| pair[0] == pair[1]) || locked != packages {
+        return Err(HardwareError::InvalidRecipe(
+            "Cargo package closure does not match Cargo.lock".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_cargo_closure(recipe: &RecipeDocument, source_root: &Path) -> Result<(), HardwareError> {
+    let Some(closure) = &recipe.cargo_closure else {
+        return Ok(());
+    };
+    validate_cargo_closure(recipe)?;
+    let configuration_root = source_root.join(".cargo");
+    if configuration_root.exists() {
+        return Err(HardwareError::InvalidSource(
+            "Cargo source contains a conflicting .cargo directory".into(),
+        ));
+    }
+    fs::create_dir(&configuration_root)?;
+    fs::write(
+        configuration_root.join("config.toml"),
+        b"[source.crates-io]\nreplace-with = \"corinth-vendor\"\n\n[source.corinth-vendor]\ndirectory = \".corinth-vendor\"\n\n[net]\noffline = true\n",
+    )?;
+    let lock_path = source_root.join("Cargo.lock");
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(HardwareError::InvalidSource(
+            "Cargo.lock is not a regular file".into(),
+        ));
+    }
+    fs::write(lock_path, closure.lock.as_bytes())?;
+    for package in &closure.packages {
+        if package.name == recipe.package.name && package.version == recipe.package.version {
+            continue;
+        }
+        let directory = source_root
+            .join(".corinth-vendor")
+            .join(format!("{}-{}", package.name, package.version));
+        let metadata = fs::symlink_metadata(&directory)
+            .map_err(|_| HardwareError::InvalidSource(directory.display().to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(HardwareError::InvalidSource(
+                directory.display().to_string(),
+            ));
+        }
+        let mut files = BTreeMap::new();
+        collect_cargo_vendor_digests(&directory, &directory, &mut files)?;
+        let checksum = serde_json::json!({
+            "files": files,
+            "package": package.checksum,
+        });
+        let bytes = serde_json::to_vec(&checksum)
+            .map_err(|error| HardwareError::InvalidSource(error.to_string()))?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(directory.join(".cargo-checksum.json"))?
+            .write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+fn collect_cargo_vendor_digests(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), HardwareError> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(HardwareError::InvalidSource(path.display().to_string()));
+        }
+        if metadata.is_dir() {
+            collect_cargo_vendor_digests(root, &path, files)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| HardwareError::InvalidSource(path.display().to_string()))?;
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| HardwareError::InvalidSource(path.display().to_string()))?
+                .replace('\\', "/");
+            let bytes = read_bounded(&path, MAX_OUTPUT_BYTES)
+                .map_err(|error| HardwareError::InvalidSource(error.to_string()))?;
+            if files
+                .insert(relative, hex_digest(&Sha256::digest(bytes)))
+                .is_some()
+            {
+                return Err(HardwareError::InvalidSource(
+                    "duplicate Cargo vendor path".into(),
+                ));
+            }
+        } else {
+            return Err(HardwareError::InvalidSource(path.display().to_string()));
         }
     }
     Ok(())
@@ -1567,9 +1839,25 @@ fn validate_source(source: &RecipeSource) -> Result<(), HardwareError> {
 
 fn valid_package_atom(value: &str) -> bool {
     !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn valid_package_atom_extended(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn valid_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
 }
 
 fn valid_build_system(value: &str) -> bool {
@@ -2720,6 +3008,104 @@ mod tests {
             validate_source(&source),
             Err(HardwareError::InvalidSource(_))
         ));
+    }
+
+    #[test]
+    fn cargo_closure_binds_every_registry_package() {
+        let checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let lock = format!(
+            "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\ndependencies = [\"helper\"]\n\n[[package]]\nname = \"helper\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+        );
+        let packages = vec![RecipeCargoPackage {
+            name: "helper".into(),
+            version: "2.0.0".into(),
+            checksum: checksum.into(),
+        }];
+        validate_cargo_lock_closure(&lock, &packages, "demo", "1.0.0").unwrap();
+        let mut drifted = packages;
+        drifted[0].version = "2.0.1".into();
+        assert!(validate_cargo_lock_closure(&lock, &drifted, "demo", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn cargo_closure_materializes_an_offline_vendor_boundary() {
+        let checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let lock = format!(
+            "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\ndependencies = [\"helper\"]\n\n[[package]]\nname = \"helper\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+        );
+        let package = RecipeCargoPackage {
+            name: "helper".into(),
+            version: "2.0.0".into(),
+            checksum: checksum.into(),
+        };
+        let recipe = RecipeDocument {
+            format: RECIPE_FORMAT,
+            package: RecipePackage {
+                name: "demo".into(),
+                version: "1.0.0".into(),
+                release: 1,
+                summary: "demo".into(),
+                license: "MIT".into(),
+                scope: "system".into(),
+                publish_authority: "arach-native".into(),
+                architectures: vec!["x86-64".into()],
+            },
+            source: vec![
+                RecipeSource {
+                    kind: "crates-io".into(),
+                    url: Some("https://crates.io/api/v1/crates/demo/1.0.0/download".into()),
+                    revision: None,
+                    checksum: Some(checksum.into()),
+                    package: Some("demo".into()),
+                    version: Some("1.0.0".into()),
+                    destination: None,
+                    submodules: false,
+                },
+                RecipeSource {
+                    kind: "crates-io".into(),
+                    url: Some("https://crates.io/api/v1/crates/helper/2.0.0/download".into()),
+                    revision: None,
+                    checksum: Some(checksum.into()),
+                    package: Some("helper".into()),
+                    version: Some("2.0.0".into()),
+                    destination: Some(".corinth-vendor/helper-2.0.0".into()),
+                    submodules: false,
+                },
+            ],
+            build: RecipeBuild {
+                system: "cargo".into(),
+                depends: vec![],
+                commands: vec!["cargo build --release --locked".into()],
+                outputs: vec!["target/release/demo".into()],
+            },
+            runtime: None,
+            policy: RecipePolicy {
+                network: false,
+                sandbox: true,
+                reproducible: true,
+            },
+            hardware: None,
+            cargo_closure: Some(RecipeCargoClosure {
+                lock: lock.clone(),
+                packages: vec![package],
+            }),
+        };
+        let root =
+            std::env::temp_dir().join(format!("corinth-cargo-closure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let vendor = root.join(".corinth-vendor/helper-2.0.0/src");
+        fs::create_dir_all(&vendor).unwrap();
+        fs::write(vendor.join("lib.rs"), b"pub fn helper() {}\n").unwrap();
+        prepare_cargo_closure(&recipe, &root).unwrap();
+        assert_eq!(fs::read_to_string(root.join("Cargo.lock")).unwrap(), lock);
+        assert!(root.join(".cargo/config.toml").is_file());
+        let checksum_document: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(".corinth-vendor/helper-2.0.0/.cargo-checksum.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(checksum_document["package"], checksum);
+        assert!(checksum_document["files"]["src/lib.rs"].is_string());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

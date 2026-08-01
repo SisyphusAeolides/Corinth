@@ -120,9 +120,10 @@ offline-cache behavior, and generation boundary are documented in
 references into unsigned candidates containing only exact Git commits and
 measured metadata. Arch and AUR repository identities are derived from the
 package name; CRUX and Nix accept explicit HTTPS Git transports. Discovery
-cannot emit a recipe or install anything, and Cargo discovery remains closed
-until the complete transitive registry graph can be checksum-bound and
-materialized offline. The provider contract and examples are documented in
+cannot emit a recipe or install anything. Cargo discovery resolves an exact
+crate version into a complete `Cargo.lock`, binds every transitive registry
+archive checksum, and produces recipes that materialize the graph through an
+offline directory source. The provider contract and examples are documented in
 [`docs/UNIVERSAL_DISCOVERY.md`](docs/UNIVERSAL_DISCOVERY.md).
 
 `corinth-ingest` is the unified unattended ingress path. It verifies a signed

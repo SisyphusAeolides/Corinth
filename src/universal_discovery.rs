@@ -4,14 +4,15 @@
 //! product is an unsigned ingress candidate containing a full Git commit and
 //! SHA-256 measurements. It cannot emit a recipe or authorize installation.
 
-use alloc::{format, string::String, string::ToString, vec};
+use alloc::{format, string::String, string::ToString, vec, vec::Vec};
 use core::fmt;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path};
 use std::process::{Command, Stdio};
 
-use crate::hardware::HardwareProvisioner;
+use crate::hardware::{HardwareProvisioner, RecipeCargoPackage, RecipeSource};
 use crate::universal_import::{
     MAXIMUM_UPSTREAM_METADATA_BYTES, UNIVERSAL_IMPORT_FORMAT, UniversalEcosystem,
     UniversalImportLock, UniversalOrigin, validate_universal_import_lock,
@@ -25,6 +26,13 @@ pub struct GitDiscoveryRequest {
     pub reference: String,
     pub metadata_path: String,
     pub source_lock_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoDiscoveryRequest {
+    pub package: String,
+    pub version: String,
+    pub architecture: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +88,131 @@ pub fn discover_git_candidate(
         .acquire_recipe_repository(&request.repository, &revision, false)
         .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
     build_git_candidate(request, &revision, &repository)
+}
+
+pub fn discover_cargo_candidate(
+    request: &CargoDiscoveryRequest,
+    provisioner: &HardwareProvisioner,
+) -> Result<UniversalImportLock, DiscoveryError> {
+    validate_cargo_discovery_request(request)?;
+    if !provisioner.allow_network {
+        return Err(DiscoveryError::InvalidRequest(
+            "Cargo discovery requires explicit network permission".into(),
+        ));
+    }
+    let resolution_root = provisioner.work_root.join(format!(
+        "cargo-resolution-{}-{}",
+        request.package, request.version
+    ));
+    if resolution_root.exists() {
+        fs::remove_dir_all(&resolution_root)
+            .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    }
+    fs::create_dir(&resolution_root)
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    let result = discover_cargo_in(&resolution_root, request, provisioner);
+    let _ = fs::remove_dir_all(&resolution_root);
+    result
+}
+
+fn discover_cargo_in(
+    resolution_root: &Path,
+    request: &CargoDiscoveryRequest,
+    provisioner: &HardwareProvisioner,
+) -> Result<UniversalImportLock, DiscoveryError> {
+    let probe = resolution_root.join("probe");
+    fs::create_dir(&probe).map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    let probe_manifest = format!(
+        "[package]\nname = \"corinth-cargo-resolution\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ncandidate = {{ package = \"{}\", version = \"={}\" }}\n",
+        request.package, request.version
+    );
+    fs::write(probe.join("Cargo.toml"), probe_manifest)
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    fs::create_dir(probe.join("src"))
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    fs::write(probe.join("src/lib.rs"), b"pub fn resolution_probe() {}\n")
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    run_cargo_resolution(&probe, resolution_root, &["generate-lockfile"])?;
+    let probe_lock = read_bounded_file(&probe.join("Cargo.lock"), 4 * 1024 * 1024)?;
+    let probe_lock = String::from_utf8(probe_lock)
+        .map_err(|_| DiscoveryError::ResolutionFailed("Cargo.lock is not UTF-8".into()))?;
+    let probe_packages = registry_packages(&probe_lock, "corinth-cargo-resolution", "0.0.0")?;
+    let root = probe_packages
+        .iter()
+        .find(|package| package.name == request.package && package.version == request.version)
+        .ok_or_else(|| {
+            DiscoveryError::ResolutionFailed("requested crate was not resolved exactly".into())
+        })?;
+    let source = RecipeSource {
+        kind: "crates-io".into(),
+        url: Some(format!(
+            "https://static.crates.io/crates/{}/{}-{}.crate",
+            request.package, request.package, request.version
+        )),
+        revision: None,
+        checksum: Some(root.checksum.clone()),
+        package: Some(request.package.clone()),
+        version: Some(request.version.clone()),
+        destination: None,
+        submodules: false,
+    };
+    let cached = provisioner
+        .acquire_locked_source(&source)
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    let crate_root = resolution_root.join("crate");
+    copy_regular_tree(&cached, &crate_root)?;
+    if crate_root.join(".cargo").exists() {
+        return Err(DiscoveryError::InvalidRequest(
+            "crate archive contains a Cargo configuration directory".into(),
+        ));
+    }
+    let manifest_bytes = read_bounded_file(&crate_root.join("Cargo.toml"), 512 * 1024)?;
+    let manifest: CargoManifest = toml::from_slice(&manifest_bytes)
+        .map_err(|error| DiscoveryError::InvalidRequest(error.to_string()))?;
+    if manifest.package.name != request.package
+        || manifest.package.version != request.version
+        || manifest.package.description.trim().is_empty()
+        || manifest.package.license.trim().is_empty()
+    {
+        return Err(DiscoveryError::InvalidRequest(
+            "crate manifest identity, description, or license is incomplete".into(),
+        ));
+    }
+    let existing_lock = crate_root.join("Cargo.lock");
+    if existing_lock.exists() {
+        fs::remove_file(&existing_lock)
+            .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    }
+    run_cargo_resolution(&crate_root, resolution_root, &["generate-lockfile"])?;
+    run_cargo_resolution(&crate_root, resolution_root, &["fetch", "--locked"])?;
+    let cargo_lock = read_bounded_file(&existing_lock, 4 * 1024 * 1024)?;
+    let cargo_lock = String::from_utf8(cargo_lock)
+        .map_err(|_| DiscoveryError::ResolutionFailed("Cargo.lock is not UTF-8".into()))?;
+    let packages = registry_packages(&cargo_lock, &request.package, &request.version)?;
+    let cargo_lock_sha256 = hex_digest(&Sha256::digest(cargo_lock.as_bytes()));
+    let candidate = UniversalImportLock {
+        format: UNIVERSAL_IMPORT_FORMAT,
+        ecosystem: UniversalEcosystem::Cargo,
+        package: request.package.clone(),
+        origin: UniversalOrigin::CratesIo {
+            version: request.version.clone(),
+            release: 1,
+            checksum: root.checksum.clone(),
+            summary: manifest.package.description,
+            license: manifest.package.license,
+            architectures: vec![request.architecture.clone()],
+            depends: vec![],
+            makedepends: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            cargo_lock,
+            cargo_lock_sha256,
+            packages,
+        },
+    };
+    validate_universal_import_lock(&candidate)
+        .map_err(|error| DiscoveryError::InvalidCandidate(error.to_string()))?;
+    Ok(candidate)
 }
 
 pub fn build_git_candidate(
@@ -163,6 +296,23 @@ pub fn validate_git_discovery_request(request: &GitDiscoveryRequest) -> Result<(
     {
         return Err(DiscoveryError::InvalidRequest(
             "Arch repository identity must be derived from the package".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_cargo_discovery_request(
+    request: &CargoDiscoveryRequest,
+) -> Result<(), DiscoveryError> {
+    if !valid_package(&request.package)
+        || !valid_version(&request.version)
+        || !matches!(
+            request.architecture.as_str(),
+            "x86-64" | "aarch64" | "riscv64"
+        )
+    {
+        return Err(DiscoveryError::InvalidRequest(
+            "Cargo package, version, or architecture is invalid".into(),
         ));
     }
     Ok(())
@@ -296,9 +446,17 @@ fn valid_repository(value: &str) -> bool {
 fn valid_package(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn valid_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
 }
 
 fn valid_reference(value: &str) -> bool {
@@ -334,6 +492,175 @@ fn hex_digest(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[derive(Deserialize)]
+struct CargoManifest {
+    package: CargoManifestPackage,
+}
+
+#[derive(Deserialize)]
+struct CargoManifestPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    license: String,
+}
+
+#[derive(Deserialize)]
+struct ResolutionLock {
+    version: u32,
+    #[serde(default)]
+    package: Vec<ResolutionPackage>,
+}
+
+#[derive(Deserialize)]
+struct ResolutionPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
+}
+
+fn registry_packages(
+    lock_text: &str,
+    root_name: &str,
+    root_version: &str,
+) -> Result<Vec<RecipeCargoPackage>, DiscoveryError> {
+    let lock: ResolutionLock = toml::from_str(lock_text)
+        .map_err(|error| DiscoveryError::ResolutionFailed(error.to_string()))?;
+    if !(3..=4).contains(&lock.version) {
+        return Err(DiscoveryError::ResolutionFailed(
+            "unsupported Cargo.lock format".into(),
+        ));
+    }
+    let mut root_count = 0usize;
+    let mut packages = Vec::new();
+    for package in lock.package {
+        match package.source.as_deref() {
+            None if package.name == root_name && package.version == root_version => {
+                root_count += 1;
+            }
+            Some("registry+https://github.com/rust-lang/crates.io-index") => {
+                let checksum = package.checksum.ok_or_else(|| {
+                    DiscoveryError::ResolutionFailed("registry checksum is missing".into())
+                })?;
+                if !valid_package(&package.name)
+                    || !valid_version(&package.version)
+                    || !valid_digest(&checksum)
+                {
+                    return Err(DiscoveryError::ResolutionFailed(
+                        "registry package identity is invalid".into(),
+                    ));
+                }
+                packages.push(RecipeCargoPackage {
+                    name: package.name,
+                    version: package.version,
+                    checksum,
+                });
+            }
+            _ => {
+                return Err(DiscoveryError::ResolutionFailed(
+                    "Cargo graph contains a non-crates.io dependency".into(),
+                ));
+            }
+        }
+    }
+    packages.sort_by(|left, right| (&left.name, &left.version).cmp(&(&right.name, &right.version)));
+    if root_count != 1 || packages.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DiscoveryError::ResolutionFailed(
+            "Cargo graph has an ambiguous package identity".into(),
+        ));
+    }
+    Ok(packages)
+}
+
+fn run_cargo_resolution(
+    crate_root: &Path,
+    resolution_root: &Path,
+    arguments: &[&str],
+) -> Result<(), DiscoveryError> {
+    let cargo_home = resolution_root.join("cargo-home");
+    fs::create_dir_all(&cargo_home)
+        .map_err(|error| DiscoveryError::ResolutionFailed(error.to_string()))?;
+    let status = Command::new("cargo")
+        .args(arguments)
+        .arg("--manifest-path")
+        .arg(crate_root.join("Cargo.toml"))
+        .current_dir(crate_root)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_NET_GIT_FETCH_WITH_CLI", "false")
+        .env("RUSTUP_NO_UPDATE_CHECK", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .map_err(|error| DiscoveryError::ResolutionFailed(error.to_string()))?;
+    if !status.success() {
+        return Err(DiscoveryError::ResolutionFailed(format!(
+            "cargo {} failed",
+            arguments.join(" ")
+        )));
+    }
+    Ok(())
+}
+
+fn copy_regular_tree(source: &Path, destination: &Path) -> Result<(), DiscoveryError> {
+    fs::create_dir_all(destination)
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if matches!(
+            entry.file_name().to_str(),
+            Some(".corinth-source-ready" | ".corinth-local-revision")
+        ) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(DiscoveryError::UnsafePath(path.display().to_string()));
+        }
+        let target = destination.join(entry.file_name());
+        if metadata.is_dir() {
+            copy_regular_tree(&path, &target)?;
+        } else if metadata.is_file() {
+            fs::copy(&path, &target)
+                .map_err(|error| DiscoveryError::AcquisitionFailed(error.to_string()))?;
+        } else {
+            return Err(DiscoveryError::UnsafePath(path.display().to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, maximum: u64) -> Result<Vec<u8>, DiscoveryError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| DiscoveryError::MetadataUnavailable(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum {
+        return Err(DiscoveryError::MetadataUnavailable(
+            path.display().to_string(),
+        ));
+    }
+    fs::read(path).map_err(|error| DiscoveryError::MetadataUnavailable(error.to_string()))
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[cfg(test)]

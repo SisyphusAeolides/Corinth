@@ -19,11 +19,14 @@ use crate::arch_import::{
 use crate::foreign_import::{
     ForeignImportError, build_foreign_recipe, parse_crux_pkgfile, parse_nix_export,
 };
-use crate::hardware::RecipeSource;
+use crate::hardware::{
+    RecipeCargoClosure, RecipeCargoPackage, RecipeSource, metadata_sha256, parse_recipe,
+    source_lock_sha256, validate_cargo_lock_closure,
+};
 
 pub const UNIVERSAL_IMPORT_FORMAT: u32 = 1;
 pub const UNIVERSAL_IMPORT_RECEIPT_FORMAT: u32 = 1;
-pub const MAXIMUM_UNIVERSAL_LOCK_BYTES: usize = 256 * 1024;
+pub const MAXIMUM_UNIVERSAL_LOCK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAXIMUM_UPSTREAM_METADATA_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,6 +81,9 @@ pub enum UniversalOrigin {
         provides: Vec<String>,
         #[serde(default)]
         conflicts: Vec<String>,
+        cargo_lock: String,
+        cargo_lock_sha256: String,
+        packages: Vec<RecipeCargoPackage>,
     },
 }
 
@@ -218,6 +224,9 @@ pub fn validate_universal_import_lock(
                 makedepends,
                 provides,
                 conflicts,
+                cargo_lock,
+                cargo_lock_sha256,
+                packages,
             },
         ) => {
             if !valid_version(version)
@@ -233,11 +242,17 @@ pub fn validate_universal_import_lock(
                     .chain(provides)
                     .chain(conflicts)
                     .any(|value| !valid_package_atom(value))
+                || cargo_lock.is_empty()
+                || cargo_lock.len() > MAXIMUM_UNIVERSAL_LOCK_BYTES
+                || !valid_digest(cargo_lock_sha256)
+                || hex_digest(&Sha256::digest(cargo_lock.as_bytes())) != *cargo_lock_sha256
             {
                 return Err(UniversalImportError::InvalidLock(
                     "crates.io origin is not a complete immutable package".into(),
                 ));
             }
+            validate_cargo_lock_closure(cargo_lock, packages, &lock.package, version)
+                .map_err(|error| UniversalImportError::InvalidLock(error.to_string()))?;
         }
         _ => {
             return Err(UniversalImportError::InvalidLock(
@@ -355,7 +370,10 @@ pub fn import_universal_lock(
     }
     let package = metadata.name.clone();
     let version = metadata.version.clone();
-    let recipe = build_foreign_recipe(&metadata, policy).map_err(map_foreign_error)?;
+    let mut recipe = build_foreign_recipe(&metadata, policy).map_err(map_foreign_error)?;
+    if lock.ecosystem == UniversalEcosystem::Cargo {
+        recipe = attach_cargo_closure(lock, recipe)?;
+    }
     Ok(UniversalImportedRecipe {
         recipe,
         upstream_evidence_sha256,
@@ -403,6 +421,7 @@ fn cargo_metadata(
         makedepends,
         provides,
         conflicts,
+        ..
     } = &lock.origin
     else {
         return Err(UniversalImportError::InvalidLock(
@@ -433,6 +452,66 @@ fn cargo_metadata(
         },
         checksum.clone(),
     ))
+}
+
+fn attach_cargo_closure(
+    lock: &UniversalImportLock,
+    imported: ImportedRecipe,
+) -> Result<ImportedRecipe, UniversalImportError> {
+    let UniversalOrigin::CratesIo {
+        version,
+        cargo_lock,
+        packages,
+        ..
+    } = &lock.origin
+    else {
+        return Err(UniversalImportError::InvalidLock(
+            "Cargo ingress has a non-Cargo origin".into(),
+        ));
+    };
+    let mut document = parse_recipe(&imported.bytes)
+        .map_err(|error| UniversalImportError::Serialization(error.to_string()))?;
+    if document.build.system != "cargo"
+        || document.policy.network
+        || document.build.commands.iter().any(|command| {
+            !command
+                .split_ascii_whitespace()
+                .any(|word| word == "--locked")
+        })
+    {
+        return Err(UniversalImportError::InvalidLock(
+            "Cargo target policy must be offline and use --locked".into(),
+        ));
+    }
+    for package in packages {
+        document.source.push(RecipeSource {
+            kind: "crates-io".into(),
+            url: Some(crates_io_url(&package.name, &package.version)),
+            revision: None,
+            checksum: Some(package.checksum.clone()),
+            package: Some(package.name.clone()),
+            version: Some(package.version.clone()),
+            destination: Some(format!(
+                ".corinth-vendor/{}-{}",
+                package.name, package.version
+            )),
+            submodules: false,
+        });
+    }
+    document.cargo_closure = Some(RecipeCargoClosure {
+        lock: cargo_lock.clone(),
+        packages: packages.clone(),
+    });
+    validate_cargo_lock_closure(cargo_lock, packages, &lock.package, version)
+        .map_err(|error| UniversalImportError::InvalidLock(error.to_string()))?;
+    let bytes = toml::to_string(&document)
+        .map(String::into_bytes)
+        .map_err(|error| UniversalImportError::Serialization(error.to_string()))?;
+    Ok(ImportedRecipe {
+        metadata_sha256: metadata_sha256(&bytes),
+        source_lock_sha256: source_lock_sha256(&document.source),
+        bytes,
+    })
 }
 
 fn read_locked_file(
@@ -496,9 +575,9 @@ fn validate_relative_path(value: &str) -> Result<(), UniversalImportError> {
 fn valid_package_atom(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 fn valid_version(value: &str) -> bool {
@@ -536,7 +615,7 @@ fn valid_https_git(value: &str) -> bool {
 }
 
 fn crates_io_url(package: &str, version: &str) -> String {
-    format!("https://crates.io/api/v1/crates/{package}/{version}/download")
+    format!("https://static.crates.io/crates/{package}/{package}-{version}.crate")
 }
 
 fn map_foreign_error(error: ForeignImportError) -> UniversalImportError {
@@ -581,7 +660,7 @@ mod tests {
     fn policy(package: &str, system: &str) -> RecipeTargetPolicy {
         parse_target_policy(
             format!(
-                "format = 1\npackage = \"{package}\"\narchitecture = \"x86-64\"\nscope = \"system\"\npublish_authority = \"arach-native\"\nbuild_system = \"{system}\"\nbuild_commands = [\"cargo build --release\"]\noutputs = [\"target/release/{package}\"]\nnetwork = false\nsandbox = true\nreproducible = true\n"
+                "format = 1\npackage = \"{package}\"\narchitecture = \"x86-64\"\nscope = \"system\"\npublish_authority = \"arach-native\"\nbuild_system = \"{system}\"\nbuild_commands = [\"cargo build --release --locked\"]\noutputs = [\"target/release/{package}\"]\nnetwork = false\nsandbox = true\nreproducible = true\n"
             )
             .as_bytes(),
         )
@@ -623,6 +702,11 @@ mod tests {
     #[test]
     fn crates_io_lock_retains_typed_source_identity() {
         let checksum = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let dependency_checksum =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cargo_lock = format!(
+            "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"2.0.0\"\ndependencies = [\"helper\"]\n\n[[package]]\nname = \"helper\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{dependency_checksum}\"\n"
+        );
         let lock = UniversalImportLock {
             format: UNIVERSAL_IMPORT_FORMAT,
             ecosystem: UniversalEcosystem::Cargo,
@@ -638,6 +722,13 @@ mod tests {
                 makedepends: vec![],
                 provides: vec![],
                 conflicts: vec![],
+                cargo_lock: cargo_lock.clone(),
+                cargo_lock_sha256: digest(cargo_lock.as_bytes()),
+                packages: vec![RecipeCargoPackage {
+                    name: "helper".into(),
+                    version: "1.0.0".into(),
+                    checksum: dependency_checksum.into(),
+                }],
             },
         };
         let source = crates_io_acquisition_source(&lock).unwrap();
@@ -648,6 +739,12 @@ mod tests {
         let recipe = parse_recipe(&imported.recipe.bytes).unwrap();
         assert_eq!(recipe.source[0].kind, "crates-io");
         assert_eq!(recipe.source[0].checksum.as_deref(), Some(checksum));
+        assert_eq!(recipe.source.len(), 2);
+        assert_eq!(
+            recipe.source[1].destination.as_deref(),
+            Some(".corinth-vendor/helper-1.0.0")
+        );
+        assert_eq!(recipe.cargo_closure.unwrap().packages.len(), 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use corinth::hardware::HardwareProvisioner;
 use corinth::universal_discovery::{
-    GitDiscoveryRequest, arch_discovery_request, aur_discovery_request, discover_git_candidate,
+    CargoDiscoveryRequest, GitDiscoveryRequest, arch_discovery_request, aur_discovery_request,
+    discover_cargo_candidate, discover_git_candidate,
 };
 use corinth::universal_import::{
     UniversalEcosystem, UniversalOrigin, serialize_universal_import_lock,
@@ -29,14 +30,20 @@ fn run() -> Result<(), String> {
                 &flags,
                 &["ecosystem", "package", "reference", "work", "output"],
             )?;
-            aur_discovery_request(package, required(&flags, "reference")?)
+            DiscoveryRequest::Git(aur_discovery_request(
+                package,
+                required(&flags, "reference")?,
+            ))
         }
         UniversalEcosystem::Arch => {
             require_keys(
                 &flags,
                 &["ecosystem", "package", "reference", "work", "output"],
             )?;
-            arch_discovery_request(package, required(&flags, "reference")?)
+            DiscoveryRequest::Git(arch_discovery_request(
+                package,
+                required(&flags, "reference")?,
+            ))
         }
         UniversalEcosystem::Nix => {
             require_keys(
@@ -51,7 +58,7 @@ fn run() -> Result<(), String> {
                     "output",
                 ],
             )?;
-            git_request(ecosystem, package, &flags, None)?
+            DiscoveryRequest::Git(git_request(ecosystem, package, &flags, None)?)
         }
         UniversalEcosystem::Crux => {
             require_keys(
@@ -67,18 +74,30 @@ fn run() -> Result<(), String> {
                     "output",
                 ],
             )?;
-            git_request(
+            DiscoveryRequest::Git(git_request(
                 ecosystem,
                 package,
                 &flags,
                 Some(required(&flags, "source-lock-path")?.into()),
-            )?
+            )?)
         }
         UniversalEcosystem::Cargo => {
-            return Err(
-                "Cargo discovery is unavailable until the complete registry dependency graph is checksum-bound"
-                    .into(),
-            );
+            require_keys(
+                &flags,
+                &[
+                    "ecosystem",
+                    "package",
+                    "version",
+                    "architecture",
+                    "work",
+                    "output",
+                ],
+            )?;
+            DiscoveryRequest::Cargo(CargoDiscoveryRequest {
+                package: package.into(),
+                version: required(&flags, "version")?.into(),
+                architecture: required(&flags, "architecture")?.into(),
+            })
         }
     };
     let work = absolute_path(required(&flags, "work")?, "work")?;
@@ -89,29 +108,50 @@ fn run() -> Result<(), String> {
     let mut provisioner = HardwareProvisioner::new(work.clone(), work.join("discovery-artifacts"))
         .map_err(|error| error.to_string())?;
     provisioner.allow_network = true;
-    let candidate =
-        discover_git_candidate(&request, &provisioner).map_err(|error| error.to_string())?;
+    let candidate = match request {
+        DiscoveryRequest::Git(request) => discover_git_candidate(&request, &provisioner),
+        DiscoveryRequest::Cargo(request) => discover_cargo_candidate(&request, &provisioner),
+    }
+    .map_err(|error| error.to_string())?;
     let bytes = serialize_universal_import_lock(&candidate).map_err(|error| error.to_string())?;
     write_atomic(&output, &bytes)?;
-    let UniversalOrigin::Git {
-        revision,
-        metadata_sha256,
-        source_lock_sha256,
-        ..
-    } = &candidate.origin
-    else {
-        return Err("discovery returned a non-Git candidate".into());
-    };
-    println!(
-        "discovered {} ecosystem={} revision={} metadata_sha256={} source_lock_sha256={} candidate_sha256={} status=unsigned",
-        candidate.package,
-        candidate.ecosystem.name(),
-        revision,
-        metadata_sha256,
-        source_lock_sha256.as_deref().unwrap_or("none"),
-        hex_digest(&Sha256::digest(&bytes)),
-    );
+    match &candidate.origin {
+        UniversalOrigin::Git {
+            revision,
+            metadata_sha256,
+            source_lock_sha256,
+            ..
+        } => println!(
+            "discovered {} ecosystem={} revision={} metadata_sha256={} source_lock_sha256={} candidate_sha256={} status=unsigned",
+            candidate.package,
+            candidate.ecosystem.name(),
+            revision,
+            metadata_sha256,
+            source_lock_sha256.as_deref().unwrap_or("none"),
+            hex_digest(&Sha256::digest(&bytes)),
+        ),
+        UniversalOrigin::CratesIo {
+            version,
+            checksum,
+            packages,
+            cargo_lock_sha256,
+            ..
+        } => println!(
+            "discovered {} ecosystem=cargo version={} archive_sha256={} dependency_archives={} cargo_lock_sha256={} candidate_sha256={} status=unsigned",
+            candidate.package,
+            version,
+            checksum,
+            packages.len(),
+            cargo_lock_sha256,
+            hex_digest(&Sha256::digest(&bytes)),
+        ),
+    }
     Ok(())
+}
+
+enum DiscoveryRequest {
+    Git(GitDiscoveryRequest),
+    Cargo(CargoDiscoveryRequest),
 }
 
 fn git_request(
@@ -152,6 +192,8 @@ fn parse_flags(arguments: Vec<String>) -> Result<BTreeMap<String, String>, Strin
                 | "reference"
                 | "metadata-path"
                 | "source-lock-path"
+                | "version"
+                | "architecture"
                 | "work"
                 | "output"
         ) {
@@ -243,7 +285,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn usage() -> String {
-    "usage: corinth-discover --ecosystem <arch|aur|crux|nix|cargo> --package NAME [--repository HTTPS_GIT] --reference <HEAD|FULL_REF|COMMIT> [--metadata-path PATH] [--source-lock-path PATH] --work ABSOLUTE_DIRECTORY --output ABSOLUTE_CANDIDATE --allow-network".into()
+    "usage: corinth-discover --ecosystem <arch|aur|crux|nix|cargo> --package NAME [--version EXACT --architecture ARCH] [--repository HTTPS_GIT] [--reference <HEAD|FULL_REF|COMMIT>] [--metadata-path PATH] [--source-lock-path PATH] --work ABSOLUTE_DIRECTORY --output ABSOLUTE_CANDIDATE --allow-network".into()
 }
 
 #[cfg(test)]
