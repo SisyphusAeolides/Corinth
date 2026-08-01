@@ -177,6 +177,12 @@ impl VariableRegistry {
     }
 }
 
+impl Default for VariableRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─────────────────────────────────────────────
 // DPLL SOLVER
 // ─────────────────────────────────────────────
@@ -395,6 +401,12 @@ impl DpllSolver {
             backtracks: self.backtracks,
             decision_level: self.decision_level,
         }
+    }
+}
+
+impl Default for DpllSolver {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

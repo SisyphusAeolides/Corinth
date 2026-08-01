@@ -132,6 +132,12 @@ impl IrBuffer {
     }
 }
 
+impl Default for IrBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─────────────────────────────────────────────
 // PASS 1: INLINER
 // Finds INLINE_SITE(fn_id) instructions and replaces them
@@ -176,6 +182,12 @@ impl FunctionTable {
 
     pub fn lookup(&self, fn_id: u8) -> Option<&FnEntry> {
         self.entries[..self.count].iter().find(|e| e.fn_id == fn_id)
+    }
+}
+
+impl Default for FunctionTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -259,6 +271,12 @@ impl InlinerPass {
         }
 
         self.inline_depth -= 1;
+    }
+}
+
+impl Default for InlinerPass {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -361,6 +379,12 @@ impl DcePass {
     }
 }
 
+impl Default for DcePass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─────────────────────────────────────────────
 // PASS 3: LOOP UNROLLER
 // Finds LOOP_BEGIN(count) ... LOOP_END patterns.
@@ -404,17 +428,17 @@ impl UnrollerPass {
                 }
             };
             let body_len = loop_end - loop_start;
-            if body_len == 0 || body_len * trip_count + buf.len > MAX_IR_INSTRUCTIONS {
+            if body_len == 0
+                || body_len > 256
+                || body_len * trip_count + buf.len > MAX_IR_INSTRUCTIONS
+            {
                 i += 1;
                 continue;
             }
 
             // Capture body
             let mut body = [Instr::NOP; 256];
-            let capture = body_len.min(256);
-            for k in 0..capture {
-                body[k] = buf.instrs[loop_start + k];
-            }
+            body[..body_len].copy_from_slice(&buf.instrs[loop_start..loop_end]);
 
             // NOP-out LOOP_BEGIN and LOOP_END
             buf.instrs[i] = Instr::NOP;
@@ -434,10 +458,11 @@ impl UnrollerPass {
             }
             // Write extra copies
             for copy in 1..trip_count {
-                for k in 0..body_len {
-                    let dst = insert_at + (copy - 1) * body_len + k;
+                let start = insert_at + (copy - 1) * body_len;
+                for (k, instr) in body[..body_len].iter().copied().enumerate() {
+                    let dst = start + k;
                     if dst < MAX_IR_INSTRUCTIONS {
-                        buf.instrs[dst] = body[k];
+                        buf.instrs[dst] = instr;
                     }
                 }
             }
@@ -463,6 +488,12 @@ impl UnrollerPass {
             }
         }
         None
+    }
+}
+
+impl Default for UnrollerPass {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -542,6 +573,12 @@ impl CrucibleEngine {
     }
 }
 
+impl Default for CrucibleEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CrucibleStats {
     pub sites_inlined: u32,
@@ -606,5 +643,37 @@ mod tests {
         // Should now have: NOP, MOV, NOP, MOV (unrolled copy)
         assert_eq!(buf.instrs[1].opcode, 0x01);
         assert_eq!(buf.instrs[3].opcode, 0x01);
+    }
+
+    #[test]
+    fn unroller_skips_bodies_larger_than_capture_buffer() {
+        let mut buf = IrBuffer::new();
+        buf.instrs[0] = Instr {
+            opcode: 0x07,
+            a: 2,
+            b: 0,
+            flags: 0,
+        };
+        for instr in &mut buf.instrs[1..258] {
+            *instr = Instr {
+                opcode: 0x01,
+                a: 1,
+                b: 2,
+                flags: 0,
+            };
+        }
+        buf.instrs[258] = Instr {
+            opcode: 0x08,
+            a: 0,
+            b: 0,
+            flags: 0,
+        };
+        buf.len = 259;
+
+        let mut unroller = UnrollerPass::new();
+        unroller.run(&mut buf);
+
+        assert_eq!(unroller.loops_unrolled, 0);
+        assert_eq!(buf.instrs[0].opcode, 0x07);
     }
 }

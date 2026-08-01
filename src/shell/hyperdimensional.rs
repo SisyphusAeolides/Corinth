@@ -12,7 +12,7 @@ impl HyperVector {
         let mut seed = 0xdeadbeef_u64;
         for (i, val) in v.iter_mut().enumerate() {
             // Mix input bytes into dimension i
-            for (_j, &b) in input.iter().enumerate() {
+            for &b in input {
                 seed ^= (b as u64).wrapping_mul(0x9e3779b97f4a7c15);
                 seed ^= seed >> 30;
                 seed = seed.wrapping_mul(0xbf58476d1ce4e5b9);
@@ -118,5 +118,11 @@ impl HolographicShell {
                     .unwrap()
             })
             .map(|(_, cmd)| cmd.as_str())
+    }
+}
+
+impl Default for HolographicShell {
+    fn default() -> Self {
+        Self::new()
     }
 }

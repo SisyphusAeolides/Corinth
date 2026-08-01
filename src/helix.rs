@@ -138,6 +138,12 @@ impl WorkQueue {
     }
 }
 
+impl Default for WorkQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─────────────────────────────────────────────
 // THERMAL GOVERNOR
 // ─────────────────────────────────────────────
@@ -299,8 +305,8 @@ impl TopoSorter {
             if usize::from(edge_lens[i]) > edges[i].len() {
                 return false;
             }
-            for j in 0..edge_lens[i] as usize {
-                let dep = edges[i][j] as usize;
+            for &edge in edges[i].iter().take(edge_lens[i] as usize) {
+                let dep = edge as usize;
                 if dep >= n {
                     return false;
                 }
@@ -328,8 +334,8 @@ impl TopoSorter {
             }
             // Decrement in-degree of all nodes that depend on `node`
             for i in 0..n {
-                for j in 0..edge_lens[i] as usize {
-                    if edges[i][j] as usize == node {
+                for &edge in edges[i].iter().take(edge_lens[i] as usize) {
+                    if edge as usize == node {
                         self.in_degree[i] = self.in_degree[i].saturating_sub(1);
                         if self.in_degree[i] == 0 {
                             queue[qt % MAX_BUILD_JOBS] = i as u16;
@@ -341,6 +347,12 @@ impl TopoSorter {
         }
 
         self.order_len == n // false = cycle detected
+    }
+}
+
+impl Default for TopoSorter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
