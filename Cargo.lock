@@ -47,6 +47,7 @@ name = "corinth"
 version = "0.1.0"
 dependencies = [
  "arach-hwd",
+ "ed25519-dalek",
  "libc",
  "serde",
  "serde_json",

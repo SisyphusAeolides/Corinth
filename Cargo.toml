@@ -23,6 +23,9 @@ serde = { version = "=1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 toml = { version = "=0.9.12", optional = true }
 
+[dev-dependencies]
+ed25519-dalek = "=3.0.0"
+
 [lib]
 path = "src/lib.rs"
 

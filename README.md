@@ -92,6 +92,25 @@ The host API is `hardware::verify_plan` followed by
 `corinth` binary exposes the same transaction boundary through `install`,
 `update`, and `remove`.
 
+The standard host interface searches every repository named by signed service
+metadata and needs no per-repository flags:
+
+```text
+corinth search example
+corinth install example
+corinth update example
+corinth remove example
+```
+
+Native Arach packages outrank source catalogs. Equal-priority conflicts fail
+as ambiguous; `PROVIDER:PACKAGE` is the explicit override. Updates retain the
+installed provider and channel and reject lower service, repository, or
+package generations. Removal is entirely receipt-driven and offline. Signed
+source entries run the complete immutable-lock, target-policy, canonical
+recipe, sandboxed build, measurement, ownership, and recovery-journal path.
+The configuration and source-catalog formats are documented in
+[`docs/PACKAGE_SERVICE.md`](docs/PACKAGE_SERVICE.md).
+
 `--recipes-git URL REV` accepts only a pinned HTTPS recipe repository and still
 requires the signed plan's exact metadata and source-lock digests. Network use
 is explicit and source retrieval never grants install authority.
@@ -125,6 +144,10 @@ crate version into a complete `Cargo.lock`, binds every transitive registry
 archive checksum, and produces recipes that materialize the graph through an
 offline directory source. The provider contract and examples are documented in
 [`docs/UNIVERSAL_DISCOVERY.md`](docs/UNIVERSAL_DISCOVERY.md).
+
+Normal users do not invoke discovery or ingestion. Repository infrastructure
+publishes their admitted outputs through a signed source catalog; the ordinary
+`corinth install` and `corinth update` commands consume that catalog directly.
 
 `corinth-ingest` is the unified unattended ingress path. It verifies a signed
 ingress lock and a separately signed target policy, resolves only an exact Git

@@ -75,7 +75,7 @@ pub struct InstalledBinaryFile {
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinaryRepositoryIndex {
     pub format: u32,
@@ -85,7 +85,7 @@ pub struct BinaryRepositoryIndex {
     pub packages: Vec<BinaryPackage>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinaryPackage {
     pub name: String,
@@ -379,25 +379,25 @@ impl<'a> PayloadCursor<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, HardwareError> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().expect("two bytes"),
-        ))
+        Ok(u16::from_le_bytes(self.array()?))
     }
 
     fn u32(&mut self) -> Result<u32, HardwareError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four bytes"),
-        ))
+        Ok(u32::from_le_bytes(self.array()?))
     }
 
     fn u64(&mut self) -> Result<u64, HardwareError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("eight bytes"),
-        ))
+        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn array32(&mut self) -> Result<[u8; 32], HardwareError> {
-        Ok(self.take(32)?.try_into().expect("32 bytes"))
+        self.array()
+    }
+
+    fn array<const LENGTH: usize>(&mut self) -> Result<[u8; LENGTH], HardwareError> {
+        self.take(LENGTH)?
+            .try_into()
+            .map_err(|_| HardwareError::InvalidSource("binary payload is truncated".into()))
     }
 
     fn text(&mut self, length: usize, label: &str) -> Result<String, HardwareError> {
@@ -546,7 +546,12 @@ impl BinaryProvisioner {
                 return Err(HardwareError::NetworkNotAllowed);
             }
             let temporary = destination.with_extension(format!("download-{}", std::process::id()));
-            run_curl(&package.url, &temporary, self.artifact_root.as_path())?;
+            run_curl(
+                &package.url,
+                &temporary,
+                self.artifact_root.as_path(),
+                package.size,
+            )?;
             let bytes = read_bounded(&temporary, MAX_OUTPUT_BYTES)
                 .map_err(|error| HardwareError::SourceUnavailable(error.to_string()))?;
             if bytes.len() as u64 != package.size {
@@ -936,6 +941,17 @@ impl BinaryInstallStore {
         }
     }
 
+    /// Return the validated ownership receipt for one installed package.
+    /// Service-level transaction recovery uses this as the authoritative view
+    /// of target-root state; it never infers installation from file names.
+    pub fn installed_receipt(
+        &self,
+        package: &str,
+    ) -> Result<Option<BinaryInstallReceipt>, HardwareError> {
+        let path = self.receipt_path(package)?;
+        self.read_receipt(&path)
+    }
+
     pub fn remove(&self, package: &str) -> Result<(), HardwareError> {
         let receipt_path = self.receipt_path(package)?;
         let receipt = self
@@ -1275,7 +1291,13 @@ fn verify_artifact(bytes: &[u8], package: &BinaryPackage) -> Result<(), Hardware
     Ok(())
 }
 
-fn run_curl(url: &str, destination: &Path, directory: &Path) -> Result<(), HardwareError> {
+fn run_curl(
+    url: &str,
+    destination: &Path,
+    directory: &Path,
+    maximum: u64,
+) -> Result<(), HardwareError> {
+    let maximum = maximum.to_string();
     let status = Command::new("curl")
         .args([
             "--fail",
@@ -1285,6 +1307,8 @@ fn run_curl(url: &str, destination: &Path, directory: &Path) -> Result<(), Hardw
             "--proto",
             "=https",
             "--tlsv1.2",
+            "--max-filesize",
+            &maximum,
             url,
             "--output",
         ])

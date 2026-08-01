@@ -86,6 +86,9 @@ mod host_cli {
     use corinth::hardware::{
         HardwareError, HardwareProvisioner, HostPackageStore, verify_plan, verify_plan_set,
     };
+    use corinth::service::{
+        DEFAULT_SERVICE_CONFIG, DEFAULT_SERVICE_KEYRING, DEFAULT_SERVICE_SIGNATURE, PackageService,
+    };
 
     pub fn run() -> Result<(), String> {
         let mut args = env::args().skip(1);
@@ -108,8 +111,11 @@ mod host_cli {
         let mut target = None;
         let mut target_signature = None;
         let mut output = None;
+        let mut service_config = None;
+        let mut service_signature = None;
         let mut package: Option<String> = None;
         let mut allow_network = false;
+        let mut offline = false;
 
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -144,7 +150,12 @@ mod host_cli {
                     target_signature = Some(PathBuf::from(args.next().ok_or_else(usage)?))
                 }
                 "--output" => output = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--config" => service_config = Some(PathBuf::from(args.next().ok_or_else(usage)?)),
+                "--config-signature" => {
+                    service_signature = Some(PathBuf::from(args.next().ok_or_else(usage)?))
+                }
                 "--allow-network" => allow_network = true,
+                "--offline" => offline = true,
                 value if !value.starts_with('-') && package.is_none() => {
                     package = Some(value.into())
                 }
@@ -153,6 +164,9 @@ mod host_cli {
         }
 
         if verb == "import-pkgbuild" {
+            if service_config.is_some() || service_signature.is_some() || offline {
+                return Err(usage());
+            }
             if pkgbuild.is_some() == pkgbuild_git.is_some() {
                 return Err(
                     "import-pkgbuild requires exactly one of --pkgbuild or --pkgbuild-git".into(),
@@ -165,7 +179,9 @@ mod host_cli {
             let pkgbuild_bytes = if let Some(path) = pkgbuild {
                 read_pkgbuild_file(&path).map_err(|error| error.to_string())?
             } else {
-                let (url, revision, relative) = pkgbuild_git.expect("validated above");
+                let (url, revision, relative) = pkgbuild_git.ok_or_else(|| {
+                    "remote PKGBUILD identity disappeared after validation".to_string()
+                })?;
                 let work_root = work.ok_or_else(|| {
                     "--work is required when importing a remote PKGBUILD".to_string()
                 })?;
@@ -197,6 +213,83 @@ mod host_cli {
                 metadata.name, metadata.version, recipe.metadata_sha256, recipe.source_lock_sha256
             );
             return Ok(());
+        }
+
+        let legacy_mode = plan.is_some()
+            || profile.is_some()
+            || profiles.is_some()
+            || catalog_lock.is_some()
+            || recipes.is_some()
+            || recipes_git.is_some()
+            || index.is_some()
+            || work.is_some()
+            || artifacts.is_some()
+            || state.is_some()
+            || root.is_some()
+            || pkgbuild.is_some()
+            || pkgbuild_git.is_some()
+            || target.is_some()
+            || target_signature.is_some()
+            || output.is_some()
+            || allow_network;
+        if matches!(verb.as_str(), "install" | "update" | "remove" | "search") && !legacy_mode {
+            let package = package.ok_or_else(usage)?;
+            let config_path =
+                service_config.unwrap_or_else(|| PathBuf::from(DEFAULT_SERVICE_CONFIG));
+            let config_signature_path = service_signature.unwrap_or_else(|| {
+                if config_path.as_path() == std::path::Path::new(DEFAULT_SERVICE_CONFIG) {
+                    PathBuf::from(DEFAULT_SERVICE_SIGNATURE)
+                } else {
+                    PathBuf::from(format!("{}.sig", config_path.display()))
+                }
+            });
+            let keyring_path = keyring.unwrap_or_else(|| PathBuf::from(DEFAULT_SERVICE_KEYRING));
+            let service =
+                PackageService::open(&config_path, &config_signature_path, &keyring_path, offline)
+                    .map_err(|error| error.to_string())?;
+            match verb.as_str() {
+                "search" => {
+                    let result = service
+                        .search(&package)
+                        .map_err(|error| error.to_string())?;
+                    println!(
+                        "found {}-{}-{} provider={} route={} priority={} generation={} sequence={}",
+                        result.package,
+                        result.version,
+                        result.release,
+                        result.provider,
+                        result.route,
+                        result.priority,
+                        result.provider_generation,
+                        result.package_sequence
+                    );
+                }
+                "install" | "update" | "remove" => {
+                    let result = match verb.as_str() {
+                        "install" => service.install(&package),
+                        "update" => service.update(&package),
+                        "remove" => service.remove(&package),
+                        _ => return Err(usage()),
+                    }
+                    .map_err(|error| error.to_string())?;
+                    println!(
+                        "{} {}-{}-{} provider={} route={} artifact={} changed={}",
+                        result.action,
+                        result.package,
+                        result.version,
+                        result.release,
+                        result.provider,
+                        result.route,
+                        result.artifact_sha256,
+                        result.changed
+                    );
+                }
+                _ => return Err(usage()),
+            }
+            return Ok(());
+        }
+        if service_config.is_some() || service_signature.is_some() || offline {
+            return Err(usage());
         }
 
         let artifacts = artifacts.ok_or_else(usage)?;
@@ -309,7 +402,9 @@ mod host_cli {
                         fs::read_to_string(signature_path).map_err(|e| e.to_string())?;
                     vec![
                         verify_plan(
-                            plans.plan.into_iter().next().expect("one plan"),
+                            plans.plan.into_iter().next().ok_or_else(|| {
+                                "hardware plan disappeared after validation".to_string()
+                            })?,
                             &profile_bytes,
                             &signature_text,
                             &trusted,
@@ -440,7 +535,7 @@ mod host_cli {
     }
 
     fn usage() -> String {
-        "usage: corinth <install|update> --plan PLAN (--profile PROFILE --signature SIG | --profiles DIR --catalog-lock LOCK) --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild (--pkgbuild PKGBUILD | --pkgbuild-git URL REV PATH) --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE [--work DIR] [--allow-network]".into()
+        "usage: corinth <install|update|remove|search> [PROVIDER:]PACKAGE[@VERSION] [--config FILE] [--config-signature FILE] [--keyring FILE] [--offline]\n       corinth <install|update> --plan PLAN (--profile PROFILE --signature SIG | --profiles DIR --catalog-lock LOCK) --keyring KEYRING --recipes DIR|--recipes-git URL REV --work DIR --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth <install|update> PACKAGE --index INDEX --signature SIG --keyring KEYRING --artifacts DIR --state DIR [--root TARGET_ROOT] [--allow-network]\n       corinth remove PACKAGE --state DIR --artifacts DIR [--root TARGET_ROOT]\n       corinth import-pkgbuild (--pkgbuild PKGBUILD | --pkgbuild-git URL REV PATH) --target TARGET --target-signature SIG --keyring KEYRING --output RECIPE [--work DIR] [--allow-network]".into()
     }
 
     fn write_recipe_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {

@@ -33,6 +33,14 @@ therefore deterministic.
 
 ## CLI
 
+Production deployments list native indexes in signed Corinth service metadata,
+so the ordinary command is simply `corinth install cosmic-session`. The
+service resolver authenticates all configured repositories, prefers native
+records, pins updates to the installed provider/channel, and records a durable
+provenance receipt. See [`PACKAGE_SERVICE.md`](PACKAGE_SERVICE.md).
+
+The explicit index form remains available to image builders and diagnostics:
+
 ```sh
 corinth install cosmic-session \
   --index stable.index.toml \

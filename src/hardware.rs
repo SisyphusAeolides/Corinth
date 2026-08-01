@@ -601,6 +601,10 @@ pub struct HardwareProvisioner {
     pub work_root: PathBuf,
     pub artifact_root: PathBuf,
     pub allow_network: bool,
+    /// Legacy image builders may bind an explicitly selected user toolchain.
+    /// The package service disables this and uses only OS-managed `/usr`
+    /// toolchains inside the sandbox.
+    pub allow_host_toolchains: bool,
     pub target_arch: String,
 }
 
@@ -620,6 +624,7 @@ impl HardwareProvisioner {
             work_root,
             artifact_root,
             allow_network: false,
+            allow_host_toolchains: true,
             target_arch: target_arch.into(),
         })
     }
@@ -668,6 +673,136 @@ impl HardwareProvisioner {
             .into_values()
             .map(|(intent, compiler)| self.build_intent(intent, compiler, recipes_root))
             .collect()
+    }
+
+    /// Build one package-index-admitted system recipe and measure the artifact
+    /// produced on this host. The caller must have authenticated the ingress
+    /// lock and target policy before invoking this crate-private path. Unlike a
+    /// hardware plan build, the resulting artifact digest is evidence produced
+    /// by the local build rather than an input asserted in advance.
+    pub(crate) fn build_admitted_system_recipe(
+        &self,
+        recipe_bytes: &[u8],
+        compiler: &CompilerTarget,
+    ) -> Result<HardwareBuildReceipt, HardwareError> {
+        fs::create_dir_all(&self.work_root)?;
+        fs::create_dir_all(&self.artifact_root)?;
+        let metadata = metadata_sha256(recipe_bytes);
+        let recipe = parse_recipe(recipe_bytes)?;
+        let source_lock = source_lock_sha256(&recipe.source);
+        let intent = CorinthIntent {
+            verb: CorinthVerb::Install,
+            name: recipe.package.name.clone(),
+            version: recipe.package.version.clone(),
+            scope: PackageScope::System,
+            repository: RepositoryAuthority::ArachNative,
+            metadata_sha256: metadata.clone(),
+            artifact_sha256: "a".repeat(64),
+            source_lock_sha256: source_lock.clone(),
+        };
+        validate_recipe(&recipe, &intent, &self.target_arch)?;
+        if recipe.build.outputs.as_slice() != ["@install-tree"] {
+            return Err(HardwareError::InvalidRecipe(
+                "service source recipes must publish @install-tree".into(),
+            ));
+        }
+        if compiler_architecture_name(compiler.architecture) != Some(self.target_arch.as_str()) {
+            return Err(HardwareError::InvalidPlan(
+                "compiler target architecture differs from the package target".into(),
+            ));
+        }
+        if !recipe.policy.sandbox || !recipe.policy.reproducible {
+            return Err(HardwareError::InvalidRecipe(
+                "service source builds require sandbox=true and reproducible=true".into(),
+            ));
+        }
+        if recipe.policy.network && !self.allow_network {
+            return Err(HardwareError::BuildNetworkNotAllowed);
+        }
+
+        let materialized_sources = kernel_materialization_sources(&recipe)?;
+        let source_dir = self.materialize_sources(&materialized_sources, &source_lock)?;
+        prepare_cargo_closure(&recipe, &source_dir)?;
+        if recipe.build.system == "cosmic" {
+            run_cosmic_workspace(
+                &source_dir,
+                recipe.policy.network,
+                compiler,
+                self.allow_host_toolchains,
+            )?;
+        } else {
+            for command in &recipe.build.commands {
+                run_build_command(
+                    command,
+                    &recipe.build.system,
+                    &source_dir,
+                    recipe.policy.network,
+                    compiler,
+                    self.allow_host_toolchains,
+                )?;
+            }
+        }
+        let (artifact_sha256, outputs) = self.measure_outputs(&recipe, &source_dir, None)?;
+        Ok(HardwareBuildReceipt {
+            package: recipe.package.name,
+            version: recipe.package.version,
+            release: recipe.package.release,
+            source_revision: source_revision(&recipe.source, &source_lock),
+            metadata_sha256: metadata,
+            source_lock_sha256: source_lock,
+            artifact_sha256,
+            outputs,
+        })
+    }
+
+    /// Convert the measured install tree from an admitted system recipe into
+    /// the same ownership-aware payload used by native binary packages.
+    pub(crate) fn payload_from_admitted_system_recipe(
+        &self,
+        recipe_bytes: &[u8],
+        receipt: &HardwareBuildReceipt,
+    ) -> Result<crate::binary::BinaryPayload, HardwareError> {
+        let recipe = parse_recipe(recipe_bytes)?;
+        if recipe.package.name != receipt.package
+            || recipe.package.version != receipt.version
+            || recipe.package.release != receipt.release
+            || recipe.package.scope != "system"
+            || recipe.package.publish_authority != "arach-native"
+            || recipe.build.outputs.as_slice() != ["@install-tree"]
+            || metadata_sha256(recipe_bytes) != receipt.metadata_sha256
+            || source_lock_sha256(&recipe.source) != receipt.source_lock_sha256
+        {
+            return Err(HardwareError::State(
+                "source build receipt does not match the admitted recipe".into(),
+            ));
+        }
+        let intent = CorinthIntent {
+            verb: CorinthVerb::Install,
+            name: receipt.package.clone(),
+            version: receipt.version.clone(),
+            scope: PackageScope::System,
+            repository: RepositoryAuthority::ArachNative,
+            metadata_sha256: receipt.metadata_sha256.clone(),
+            artifact_sha256: receipt.artifact_sha256.clone(),
+            source_lock_sha256: receipt.source_lock_sha256.clone(),
+        };
+        let payload = self.payload_from_receipt(&intent, receipt)?;
+        let mut digest = Sha256::new();
+        for file in &payload.files {
+            digest.update(file.path.as_bytes());
+            digest.update([0]);
+            digest.update(file.mode.to_le_bytes());
+            digest.update(&file.bytes);
+        }
+        let actual = hex_digest(&digest.finalize());
+        if actual != receipt.artifact_sha256 {
+            return Err(HardwareError::ArtifactDigestMismatch {
+                package: receipt.package.clone(),
+                expected: receipt.artifact_sha256.clone(),
+                actual,
+            });
+        }
+        Ok(payload)
     }
 
     /// Install the measured output of a verified hardware plan into a target
@@ -886,9 +1021,19 @@ impl HardwareProvisioner {
         let source_dir = self.materialize_sources(&materialized_sources, &source_lock)?;
         prepare_cargo_closure(&recipe, &source_dir)?;
         if recipe.build.system == "cosmic" {
-            run_cosmic_workspace(&source_dir, recipe.policy.network, compiler)?;
+            run_cosmic_workspace(
+                &source_dir,
+                recipe.policy.network,
+                compiler,
+                self.allow_host_toolchains,
+            )?;
         } else if is_fixed_kernel_recipe(&recipe) {
-            run_arach_kernel_workspace(&source_dir, recipe.policy.network, compiler)?;
+            run_arach_kernel_workspace(
+                &source_dir,
+                recipe.policy.network,
+                compiler,
+                self.allow_host_toolchains,
+            )?;
         } else {
             for command in &recipe.build.commands {
                 run_build_command(
@@ -897,10 +1042,15 @@ impl HardwareProvisioner {
                     &source_dir,
                     recipe.policy.network,
                     compiler,
+                    self.allow_host_toolchains,
                 )?;
             }
         }
-        let (artifact_digest, outputs) = self.measure_outputs(&recipe, &source_dir, intent)?;
+        let (artifact_digest, outputs) = self.measure_outputs(
+            &recipe,
+            &source_dir,
+            Some((&intent.name, &intent.artifact_sha256)),
+        )?;
         Ok(HardwareBuildReceipt {
             package: recipe.package.name,
             version: recipe.package.version,
@@ -1227,10 +1377,10 @@ impl HardwareProvisioner {
         &self,
         recipe: &RecipeDocument,
         source_dir: &Path,
-        intent: &CorinthIntent,
+        expected: Option<(&str, &str)>,
     ) -> Result<(String, Vec<PathBuf>), HardwareError> {
         if recipe.build.outputs.as_slice() == ["@install-tree"] {
-            return self.measure_install_tree(recipe, source_dir, intent);
+            return self.measure_install_tree(recipe, source_dir, expected);
         }
         if recipe.build.outputs.is_empty() {
             return Err(HardwareError::InvalidRecipe(
@@ -1258,10 +1408,12 @@ impl HardwareProvisioner {
             digest.update(bytes);
         }
         let actual = hex_digest(&digest.finalize());
-        if actual != intent.artifact_sha256 {
+        if let Some((package, expected)) = expected
+            && actual != expected
+        {
             return Err(HardwareError::ArtifactDigestMismatch {
-                package: intent.name.clone(),
-                expected: intent.artifact_sha256.clone(),
+                package: package.into(),
+                expected: expected.into(),
                 actual,
             });
         }
@@ -1276,14 +1428,14 @@ impl HardwareProvisioner {
             atomic_write(&target, &bytes)?;
             published.push(target);
         }
-        Ok((intent.artifact_sha256.clone(), published))
+        Ok((actual, published))
     }
 
     fn measure_install_tree(
         &self,
         recipe: &RecipeDocument,
         source_dir: &Path,
-        intent: &CorinthIntent,
+        expected: Option<(&str, &str)>,
     ) -> Result<(String, Vec<PathBuf>), HardwareError> {
         let install_root = source_dir.join(".corinth-install");
         let metadata = fs::symlink_metadata(&install_root)
@@ -1299,7 +1451,7 @@ impl HardwareProvisioner {
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         let mut digest = Sha256::new();
         let mut total = 0_u64;
-        for (relative, bytes, _) in &entries {
+        for (relative, bytes, mode) in &entries {
             total = total
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| HardwareError::OutputRejected(relative.clone()))?;
@@ -1310,13 +1462,18 @@ impl HardwareProvisioner {
             }
             digest.update(relative.as_bytes());
             digest.update([0]);
+            if expected.is_none() {
+                digest.update(mode.to_le_bytes());
+            }
             digest.update(bytes);
         }
         let actual = hex_digest(&digest.finalize());
-        if actual != intent.artifact_sha256 {
+        if let Some((package, expected)) = expected
+            && actual != expected
+        {
             return Err(HardwareError::ArtifactDigestMismatch {
-                package: intent.name.clone(),
-                expected: intent.artifact_sha256.clone(),
+                package: package.into(),
+                expected: expected.into(),
                 actual,
             });
         }
@@ -1341,7 +1498,7 @@ impl HardwareProvisioner {
             atomic_write_mode(&target, &bytes, mode)?;
             published.push(target);
         }
-        Ok((intent.artifact_sha256.clone(), published))
+        Ok((actual, published))
     }
 }
 
@@ -1984,6 +2141,7 @@ fn run_arach_kernel_workspace(
     directory: &Path,
     network: bool,
     compiler: &CompilerTarget,
+    allow_host_toolchains: bool,
 ) -> Result<(), HardwareError> {
     if network {
         return Err(HardwareError::BuildNetworkNotAllowed);
@@ -2031,6 +2189,7 @@ fn run_arach_kernel_workspace(
         ],
         &[("CARGO_TARGET_DIR", path_str(&push_target)?)],
         compiler,
+        allow_host_toolchains,
     )?;
     run_kernel_cargo(
         directory,
@@ -2051,6 +2210,7 @@ fn run_arach_kernel_workspace(
         ],
         &[("CARGO_TARGET_DIR", path_str(&probe_target)?)],
         compiler,
+        allow_host_toolchains,
     )?;
 
     let push_image = push_target.join("x86_64-arach/release/push");
@@ -2086,6 +2246,7 @@ fn run_arach_kernel_workspace(
             ("ARACH_BOOTSTRAP_ABI", "linux"),
         ],
         compiler,
+        allow_host_toolchains,
     )?;
     require_nonempty_regular(
         &kernel_target.join("x86_64-arach/release/arach"),
@@ -2098,6 +2259,7 @@ fn run_kernel_cargo(
     arguments: &[&str],
     environment: &[(&str, &str)],
     compiler: &CompilerTarget,
+    allow_host_toolchains: bool,
 ) -> Result<(), HardwareError> {
     let status = run_sandboxed(
         "cargo",
@@ -2106,6 +2268,7 @@ fn run_kernel_cargo(
         false,
         environment,
         Some(compiler),
+        allow_host_toolchains,
     )?;
     if status.success() {
         Ok(())
@@ -2134,12 +2297,21 @@ fn run_build_command(
     directory: &Path,
     network: bool,
     compiler: &CompilerTarget,
+    allow_host_toolchains: bool,
 ) -> Result<(), HardwareError> {
     let argv = parse_command(command)?;
     if argv.is_empty() || !allowed_program(system, argv[0]) {
         return Err(HardwareError::CommandRejected(command.into()));
     }
-    let status = run_sandboxed(argv[0], &argv[1..], directory, network, &[], Some(compiler))?;
+    let status = run_sandboxed(
+        argv[0],
+        &argv[1..],
+        directory,
+        network,
+        &[],
+        Some(compiler),
+        allow_host_toolchains,
+    )?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(command.into()));
     }
@@ -2155,6 +2327,7 @@ fn run_cosmic_workspace(
     directory: &Path,
     network: bool,
     compiler: &CompilerTarget,
+    allow_host_toolchains: bool,
 ) -> Result<(), HardwareError> {
     let justfile = directory.join("justfile");
     let metadata = fs::symlink_metadata(&justfile)
@@ -2164,7 +2337,13 @@ fn run_cosmic_workspace(
             "COSMIC justfile is not a regular file".into(),
         ));
     }
-    run_cosmic_phase(directory, &["build"], network, compiler)?;
+    run_cosmic_phase(
+        directory,
+        &["build"],
+        network,
+        compiler,
+        allow_host_toolchains,
+    )?;
     let install_root = directory.join(".corinth-install");
     if let Ok(existing) = fs::symlink_metadata(&install_root) {
         if existing.file_type().is_symlink() || !existing.is_dir() {
@@ -2181,6 +2360,7 @@ fn run_cosmic_workspace(
         &[&rootdir, "prefix=/usr", "install"],
         network,
         compiler,
+        allow_host_toolchains,
     )?;
     install_cosmic_greeter_config(directory, &install_root)?;
     reject_symlinks(&install_root)
@@ -2218,8 +2398,17 @@ fn run_cosmic_phase(
     arguments: &[&str],
     network: bool,
     compiler: &CompilerTarget,
+    allow_host_toolchains: bool,
 ) -> Result<(), HardwareError> {
-    let status = run_sandboxed("just", arguments, directory, network, &[], Some(compiler))?;
+    let status = run_sandboxed(
+        "just",
+        arguments,
+        directory,
+        network,
+        &[],
+        Some(compiler),
+        allow_host_toolchains,
+    )?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(format!(
             "just {} failed",
@@ -2242,6 +2431,7 @@ fn run_sandboxed(
     network: bool,
     environment: &[(&str, &str)],
     compiler: Option<&CompilerTarget>,
+    allow_host_toolchains: bool,
 ) -> Result<std::process::ExitStatus, HardwareError> {
     validate_sandbox_backend()?;
     let source = fs::canonicalize(directory)
@@ -2255,7 +2445,7 @@ fn run_sandboxed(
     }
 
     let mut command = Command::new(SANDBOX_PROGRAM);
-    append_sandbox_boundary(&mut command, &source, network)?;
+    append_sandbox_boundary(&mut command, &source, network, allow_host_toolchains)?;
     for (name, value) in environment {
         if !valid_environment_name(name) || value.contains('\0') {
             return Err(HardwareError::CommandRejected(format!(
@@ -2405,6 +2595,7 @@ fn append_sandbox_boundary(
     command: &mut Command,
     source: &Path,
     network: bool,
+    allow_host_toolchains: bool,
 ) -> Result<(), HardwareError> {
     command.args([
         "--die-with-parent",
@@ -2469,29 +2660,32 @@ fn append_sandbox_boundary(
     }
 
     let mut tool_roots = BTreeSet::new();
-    let mut sandbox_path = vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")];
-    for name in ["RUSTUP_HOME", "IDRIS2_PREFIX", "AGDA_DIR"] {
-        if let Some(root) = absolute_environment_directory(name) {
-            tool_roots.insert(root);
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for relative in [".rustup", ".idris2", ".agda"] {
-            let root = home.join(relative);
-            if fs::symlink_metadata(&root)
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            {
+    let mut sandbox_path = vec![PathBuf::from("/usr/bin")];
+    if allow_host_toolchains {
+        sandbox_path.insert(0, PathBuf::from("/usr/local/bin"));
+        for name in ["RUSTUP_HOME", "IDRIS2_PREFIX", "AGDA_DIR"] {
+            if let Some(root) = absolute_environment_directory(name) {
                 tool_roots.insert(root);
             }
         }
-    }
-    if let Some(cargo_home) = cargo_home() {
-        let bin = cargo_home.join("bin");
-        if fs::symlink_metadata(&bin)
-            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        {
-            sandbox_path.insert(0, bin.clone());
-            tool_roots.insert(bin);
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            for relative in [".rustup", ".idris2", ".agda"] {
+                let root = home.join(relative);
+                if fs::symlink_metadata(&root)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                {
+                    tool_roots.insert(root);
+                }
+            }
+        }
+        if let Some(cargo_home) = cargo_home() {
+            let bin = cargo_home.join("bin");
+            if fs::symlink_metadata(&bin)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                sandbox_path.insert(0, bin.clone());
+                tool_roots.insert(bin);
+            }
         }
     }
     let sandbox_path = std::env::join_paths(&sandbox_path)
@@ -2504,7 +2698,7 @@ fn append_sandbox_boundary(
         command.args(["--ro-bind", root, root]);
     }
 
-    if let Some(cargo_home) = cargo_home() {
+    if allow_host_toolchains && let Some(cargo_home) = cargo_home() {
         for child in ["registry", "git"] {
             let cache = cargo_home.join(child);
             if fs::symlink_metadata(&cache)
@@ -2531,16 +2725,18 @@ fn append_sandbox_boundary(
     if !network {
         command.args(["--setenv", "CARGO_NET_OFFLINE", "true"]);
     }
-    if let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") {
-        command.args(["--setenv", "RUSTUP_TOOLCHAIN", &toolchain]);
-    }
-    if let Some(rustup_home) = absolute_environment_directory("RUSTUP_HOME").or_else(|| {
-        let path = PathBuf::from(std::env::var_os("HOME")?).join(".rustup");
-        fs::symlink_metadata(&path)
-            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            .then_some(path)
-    }) {
-        command.args(["--setenv", "RUSTUP_HOME", path_str(&rustup_home)?]);
+    if allow_host_toolchains {
+        if let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") {
+            command.args(["--setenv", "RUSTUP_TOOLCHAIN", &toolchain]);
+        }
+        if let Some(rustup_home) = absolute_environment_directory("RUSTUP_HOME").or_else(|| {
+            let path = PathBuf::from(std::env::var_os("HOME")?).join(".rustup");
+            fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                .then_some(path)
+        }) {
+            command.args(["--setenv", "RUSTUP_HOME", path_str(&rustup_home)?]);
+        }
     }
     Ok(())
 }
@@ -3208,6 +3404,7 @@ mod tests {
             true,
             &[],
             None,
+            true,
         )
         .unwrap();
         if !status.success() {
@@ -3217,7 +3414,7 @@ mod tests {
         }
         assert_eq!(fs::read(root.join("sandbox-write")).unwrap(), b"sealed");
         assert!(
-            run_sandboxed("cargo", &["--version"], &root, true, &[], None)
+            run_sandboxed("cargo", &["--version"], &root, true, &[], None, true)
                 .unwrap()
                 .success()
         );
@@ -3229,7 +3426,7 @@ mod tests {
     fn offline_boundary_never_retains_the_callers_network_namespace() {
         let root = std::env::temp_dir();
         let mut offline = Command::new(SANDBOX_PROGRAM);
-        append_sandbox_boundary(&mut offline, &root, false).unwrap();
+        append_sandbox_boundary(&mut offline, &root, false, true).unwrap();
         let offline = offline
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -3238,8 +3435,27 @@ mod tests {
         assert!(!offline.iter().any(|argument| argument == "--share-net"));
 
         let mut online = Command::new(SANDBOX_PROGRAM);
-        append_sandbox_boundary(&mut online, &root, true).unwrap();
+        append_sandbox_boundary(&mut online, &root, true, true).unwrap();
         assert!(online.get_args().any(|argument| argument == "--share-net"));
+    }
+
+    #[test]
+    fn package_service_boundary_excludes_mutable_host_toolchains() {
+        let root = std::env::temp_dir();
+        let mut command = Command::new(SANDBOX_PROGRAM);
+        append_sandbox_boundary(&mut command, &root, false, false).unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["PATH", "/usr/bin"])
+        );
+        for value in [".cargo", ".rustup", ".idris2", ".agda", "RUSTUP_HOME"] {
+            assert!(!arguments.iter().any(|argument| argument.contains(value)));
+        }
     }
 
     #[test]

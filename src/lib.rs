@@ -22,6 +22,8 @@ pub mod net;
 pub mod pkg;
 pub mod policy;
 pub mod registry;
+#[cfg(feature = "host-store")]
+pub mod service;
 pub mod shell;
 pub mod source;
 #[cfg(feature = "host-store")]

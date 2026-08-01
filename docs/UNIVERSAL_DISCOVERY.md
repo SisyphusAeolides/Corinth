@@ -104,3 +104,15 @@ archives into a private directory source, writes file-level Cargo checksums,
 installs the candidate's exact `Cargo.lock`, and supplies an offline Cargo
 source replacement. Cargo target policy must disable build networking and every
 build command must use `--locked`.
+
+## Package-service publication
+
+Discovery output is an administrative candidate, not a user installation
+interface. Repository infrastructure signs the immutable ingress lock and its
+separate target policy, computes the deterministic recipe and source-lock
+digests, and publishes those identities in a signed Corinth source catalog.
+The standard `corinth install PACKAGE` resolver searches those configured
+catalogs after native repositories and performs ingestion, build, measurement,
+installation, and provenance journaling as one lifecycle operation. See
+[`PACKAGE_SERVICE.md`](PACKAGE_SERVICE.md) for the catalog schema and resolver
+rules.

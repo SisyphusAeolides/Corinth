@@ -91,3 +91,53 @@ data Publishes : Generation durability -> Active -> Type where
 public export
 volatileCannotPublish : Publishes Staged active -> Void
 volatileCannotPublish value impossible
+
+public export
+data Route = NativeRoute | SourceRoute
+
+public export
+data ProviderTrust = UnverifiedProvider | VerifiedProvider
+
+public export
+data Candidate : ProviderTrust -> Type where
+  UnverifiedCandidate : Route -> Candidate UnverifiedProvider
+  VerifiedCandidate : Route -> Candidate VerifiedProvider
+
+public export
+data Selectable : Candidate trust -> Type where
+  SelectVerified : Selectable (VerifiedCandidate route)
+
+public export
+unverifiedCannotSelect : Selectable (UnverifiedCandidate route) -> Void
+unverifiedCannotSelect value impossible
+
+public export
+data NativeAvailability = NativePresent | NativeAbsent
+
+public export
+data Resolution : NativeAvailability -> Route -> Type where
+  PreferNative : Resolution NativePresent NativeRoute
+  SourceFallback : Resolution NativeAbsent SourceRoute
+
+public export
+nativePresentCannotSelectSource : Resolution NativePresent SourceRoute -> Void
+nativePresentCannotSelectSource value impossible
+
+public export
+data Ownership = NoOwner | OldOwner | NewOwner
+
+public export
+data Operation = Installing | Updating | Removing
+
+public export
+data Recovers : Operation -> Ownership -> Type where
+  InstallAbsent : Recovers Installing NoOwner
+  InstallCommitted : Recovers Installing NewOwner
+  UpdateOld : Recovers Updating OldOwner
+  UpdateNew : Recovers Updating NewOwner
+  RemoveOld : Recovers Removing OldOwner
+  RemoveCommitted : Recovers Removing NoOwner
+
+public export
+updateCannotRecoverAbsent : Recovers Updating NoOwner -> Void
+updateCannotRecoverAbsent value impossible

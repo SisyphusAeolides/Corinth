@@ -70,3 +70,46 @@ data Publishes : Generation volatile → Active → Set where
 
 volatile-cannot-publish : ∀ {generation active} → Publishes generation active → Empty
 volatile-cannot-publish ()
+
+data Route : Set where
+  nativeRoute sourceRoute : Route
+
+data ProviderTrust : Set where
+  unverifiedProvider verifiedProvider : ProviderTrust
+
+data Candidate : ProviderTrust → Set where
+  unverifiedCandidate : Route → Candidate unverifiedProvider
+  verifiedCandidate : Route → Candidate verifiedProvider
+
+data Selectable : ∀ {trust} → Candidate trust → Set where
+  selectVerified : ∀ {route} → Selectable (verifiedCandidate route)
+
+unverified-cannot-select : ∀ {route} → Selectable (unverifiedCandidate route) → Empty
+unverified-cannot-select ()
+
+data NativeAvailability : Set where
+  nativePresent nativeAbsent : NativeAvailability
+
+data Resolution : NativeAvailability → Route → Set where
+  preferNative : Resolution nativePresent nativeRoute
+  sourceFallback : Resolution nativeAbsent sourceRoute
+
+native-present-cannot-select-source : Resolution nativePresent sourceRoute → Empty
+native-present-cannot-select-source ()
+
+data Ownership : Set where
+  noOwner oldOwner newOwner : Ownership
+
+data Operation : Set where
+  installing updating removing : Operation
+
+data Recovers : Operation → Ownership → Set where
+  installAbsent : Recovers installing noOwner
+  installCommitted : Recovers installing newOwner
+  updateOld : Recovers updating oldOwner
+  updateNew : Recovers updating newOwner
+  removeOld : Recovers removing oldOwner
+  removeCommitted : Recovers removing noOwner
+
+update-cannot-recover-absent : Recovers updating noOwner → Empty
+update-cannot-recover-absent ()
