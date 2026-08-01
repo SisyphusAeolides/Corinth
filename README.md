@@ -19,7 +19,7 @@ Agda proves that raw build sources cannot acquire system-driver authority.
 ## Current Arach OS integration
 
 The current Arach OS component lock pins Corinth
-`017a20599e68c5d374890de33ea611c491e07ec6`.
+`b4c1e0c4d7ba2dd5492179ccfad0b50f7ce285ec`.
 
 Arach-Packages validation fetches that exact revision and builds its declared
 native outputs rather than substituting a local checkout. Arach OS then
