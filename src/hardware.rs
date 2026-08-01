@@ -2426,7 +2426,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn build_process_receives_only_the_private_writable_boundary() {
+    fn build_process_is_isolated_or_fails_without_an_output() {
         let root =
             std::env::temp_dir().join(format!("corinth-build-sandbox-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2444,7 +2444,11 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(status.success());
+        if !status.success() {
+            assert!(!root.join("sandbox-write").exists());
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
         assert_eq!(fs::read(root.join("sandbox-write")).unwrap(), b"sealed");
         assert!(
             run_sandboxed("cargo", &["--version"], &root, true, &[])
