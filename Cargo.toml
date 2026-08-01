@@ -45,6 +45,11 @@ name = "corinth-import-foreign"
 path = "src/bin/corinth-import-foreign.rs"
 required-features = ["host-store"]
 
+[[bin]]
+name = "corinth-ingest"
+path = "src/bin/corinth-ingest.rs"
+required-features = ["host-store"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

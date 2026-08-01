@@ -9,6 +9,22 @@ public export
 data Scope = BuildInput | User | System | Driver | Firmware
 
 public export
+data IngressState = MutableCandidate | AuthenticatedLock
+
+public export
+data Ingress : IngressState -> Type where
+  Discovered : Source -> Ingress MutableCandidate
+  SignedLock : Source -> Ingress AuthenticatedLock
+
+public export
+data Translates : Ingress state -> Type where
+  Canonicalize : Translates (SignedLock source)
+
+public export
+unsignedCannotTranslate : Translates (Discovered source) -> Void
+unsignedCannotTranslate value impossible
+
+public export
 record Authority where
   constructor MkAuthority
   source : Source

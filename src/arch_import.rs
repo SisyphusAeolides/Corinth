@@ -46,17 +46,20 @@ pub struct ArchSource {
     pub url: String,
     pub revision: Option<String>,
     pub checksum: Option<String>,
+    pub package: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchSourceKind {
     Git,
     Archive,
+    CratesIo,
 }
 
-/// HWD-selected build policy.  HWD supplies the target facts and signed
-/// profile; this structure is the already-authorized, deterministic build
-/// choice for one imported package.
+/// Package-index-selected build policy. For driver and firmware recipes, its
+/// typed hardware fields must agree with the separately verified Arach-HWD
+/// plan; HWD itself never emits commands or repository locations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchTargetProfile {
     pub architecture: String,
@@ -73,10 +76,10 @@ pub struct ArchTargetProfile {
 
 /// Arach-HWD's signed, target-specific build decision.
 ///
-/// This is deliberately a flat document so an HWD policy generator can emit
-/// it without embedding a package-manager language.  The detached signature
-/// is verified by the Corinth CLI with the `package-index` key scope before
-/// this document is accepted.
+/// This is deliberately a flat document so the package policy service can
+/// emit it without embedding a package-manager language. The detached
+/// signature is verified by the Corinth CLI with the `package-index` key scope
+/// before this document is accepted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeTargetPolicy {
@@ -129,9 +132,9 @@ impl fmt::Display for ArchImportError {
 
 impl std::error::Error for ArchImportError {}
 
-/// Parse and validate an HWD-generated target policy without executing any
-/// package code.  Signature verification is intentionally performed by the
-/// caller before this function is used for an installation decision.
+/// Parse and validate a package-index target policy without executing package
+/// code. Signature verification is intentionally performed by the caller
+/// before this function is used for an installation decision.
 pub fn parse_target_policy(bytes: &[u8]) -> Result<RecipeTargetPolicy, ArchImportError> {
     if bytes.is_empty() || bytes.len() > MAX_PKGBUILD_BYTES {
         return Err(ArchImportError::TooLarge);
@@ -328,7 +331,7 @@ pub fn parse_pkgbuild(bytes: &[u8]) -> Result<ArchPackageMetadata, ArchImportErr
     })
 }
 
-/// Convert parsed Arch metadata plus an HWD-selected target policy into the
+/// Convert parsed Arch metadata plus a signed target policy into the
 /// canonical Arach recipe.  The returned digests are the values that must be
 /// placed in the signed Arach/HWD intent.
 pub fn build_recipe(
@@ -420,6 +423,16 @@ pub fn build_recipe(
                 checksum: source.checksum.clone(),
                 package: None,
                 version: None,
+                destination: None,
+                submodules: false,
+            },
+            ArchSourceKind::CratesIo => RecipeSource {
+                kind: "crates-io".into(),
+                url: Some(source.url.clone()),
+                revision: None,
+                checksum: source.checksum.clone(),
+                package: source.package.clone(),
+                version: source.version.clone(),
                 destination: None,
                 submodules: false,
             },
@@ -658,6 +671,8 @@ fn parse_source(value: &str, checksum: Option<&str>) -> Result<ArchSource, ArchI
             url: url.into(),
             revision: Some(revision.into()),
             checksum: None,
+            package: None,
+            version: None,
         })
     } else {
         if !https_url(raw) {
@@ -674,6 +689,8 @@ fn parse_source(value: &str, checksum: Option<&str>) -> Result<ArchSource, ArchI
             url: raw.into(),
             revision: None,
             checksum: Some(checksum.into()),
+            package: None,
+            version: None,
         })
     }
 }

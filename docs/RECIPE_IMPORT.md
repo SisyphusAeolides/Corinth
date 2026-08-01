@@ -12,7 +12,7 @@ PKGBUILD metadata + checksums
              │
              ├── exact package name/version/architecture
              ├── HTTPS archive checksums or full Git revisions
-             └── HWD-signed target policy
+             └── package-index-signed target policy
                          │
                          ▼
               canonical Arach recipe + digests

@@ -116,6 +116,34 @@ offline-cache behavior, and generation boundary are documented in
 
 ## External recipe imports
 
+`corinth-ingest` is the unified unattended ingress path. It verifies a signed
+ingress lock and a separately signed target policy, resolves only an exact Git
+object or checksummed crates.io archive, remeasures upstream metadata, emits
+one canonical recipe, and writes a receipt binding the ingress lock, upstream
+evidence, recipe, and recipe source-lock digests. Arch and AUR PKGBUILDs, CRUX
+Pkgfiles, fixed-output Nix exports, Cargo crates, and GitHub-hosted repositories
+therefore use one reproducibility boundary:
+
+```text
+corinth-ingest \
+  --lock ingress.toml \
+  --lock-signature ingress.toml.sig \
+  --target target.toml \
+  --target-signature target.toml.sig \
+  --keyring /etc/arach/hwd/keys.toml \
+  --work /var/cache/corinth/ingress \
+  --output /var/lib/corinth/recipes/example.toml \
+  --receipt /var/lib/corinth/receipts/example.toml \
+  --allow-network
+```
+
+GitHub is transport rather than package authority. The lock names the package
+ecosystem, repository, full revision, bounded metadata path, and SHA-256.
+Cargo locks instead name an exact crates.io package version and archive
+checksum. A discovered candidate cannot skip either signature or install
+directly; normal signed repository admission, measured build, and generation
+publication remain downstream.
+
 The `arch_import` module parses static PKGBUILD assignments without sourcing
 shell. It emits a canonical recipe only when a signed target policy supplies
 explicit commands and outputs. Split packages, dynamic variables, unpinned Git
@@ -145,8 +173,9 @@ corinth import-pkgbuild \
   --allow-network
 ```
 
-Symlink traversal and parent components are rejected. The detached HWD policy
-still decides how the machine may build and install the imported package.
+Symlink traversal and parent components are rejected. The detached package
+policy still decides how the machine may build the imported package; a
+separate HWD plan is required before any driver or firmware installation.
 For non-Arch ecosystems, the `corinth-import-foreign` host worker accepts only
 static, source-locked metadata:
 

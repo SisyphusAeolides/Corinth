@@ -52,6 +52,10 @@ pub struct ForeignSource {
     pub revision: Option<String>,
     #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1031,6 +1035,8 @@ fn validate_manifest(manifest: &ForeignManifest) -> Result<(), ForeignImportErro
             "git" => {
                 if !source.revision.as_deref().is_some_and(valid_revision)
                     || source.sha256.is_some()
+                    || source.package.is_some()
+                    || source.version.is_some()
                 {
                     return Err(ForeignImportError::InvalidField(format!(
                         "Git source is not pinned: {}",
@@ -1039,10 +1045,30 @@ fn validate_manifest(manifest: &ForeignManifest) -> Result<(), ForeignImportErro
                 }
             }
             "archive" => {
-                if !source.sha256.as_deref().is_some_and(valid_digest) || source.revision.is_some()
+                if !source.sha256.as_deref().is_some_and(valid_digest)
+                    || source.revision.is_some()
+                    || source.package.is_some()
+                    || source.version.is_some()
                 {
                     return Err(ForeignImportError::InvalidField(format!(
                         "archive source lacks SHA-256: {}",
+                        source.url
+                    )));
+                }
+            }
+            "crates-io" => {
+                if !source.sha256.as_deref().is_some_and(valid_digest)
+                    || source.revision.is_some()
+                    || source.package.as_deref() != Some(manifest.package.name.as_str())
+                    || source.version.as_deref() != manifest.package.version.as_deref()
+                    || !is_crates_io_url(
+                        &source.url,
+                        source.package.as_deref().unwrap_or_default(),
+                        source.version.as_deref().unwrap_or_default(),
+                    )
+                {
+                    return Err(ForeignImportError::InvalidField(format!(
+                        "crates.io source is not an immutable package lock: {}",
                         source.url
                     )));
                 }
@@ -1090,14 +1116,16 @@ fn build_metadata(
         .sources
         .iter()
         .map(|source| ArchSource {
-            kind: if source.kind == "git" {
-                ArchSourceKind::Git
-            } else {
-                ArchSourceKind::Archive
+            kind: match source.kind.as_str() {
+                "git" => ArchSourceKind::Git,
+                "crates-io" => ArchSourceKind::CratesIo,
+                _ => ArchSourceKind::Archive,
             },
             url: source.url.clone(),
             revision: source.revision.clone(),
             checksum: source.sha256.clone(),
+            package: source.package.clone(),
+            version: source.version.clone(),
         })
         .collect();
     Ok(ArchPackageMetadata {
@@ -1336,6 +1364,11 @@ fn is_https_url(value: &str) -> bool {
         && !value.contains(char::is_whitespace)
         && !value.contains('@')
         && !value.contains('#')
+}
+
+fn is_crates_io_url(value: &str, package: &str, version: &str) -> bool {
+    value == format!("https://crates.io/api/v1/crates/{package}/{version}/download")
+        || value == format!("https://static.crates.io/crates/{package}/{package}-{version}.crate")
 }
 
 #[cfg(test)]

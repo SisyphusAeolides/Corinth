@@ -27,3 +27,5 @@ pub mod source;
 #[cfg(feature = "host-store")]
 pub mod store;
 pub mod synthesizer;
+#[cfg(feature = "host-store")]
+pub mod universal_import;

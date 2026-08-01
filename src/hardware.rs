@@ -814,6 +814,16 @@ impl HardwareProvisioner {
         })
     }
 
+    /// Fetches one fully locked build input into the private source cache.
+    ///
+    /// This is an availability operation only. The returned path carries no
+    /// package or installation authority; callers must still admit the
+    /// canonical recipe and its signed repository intent.
+    pub fn acquire_locked_source(&self, source: &RecipeSource) -> Result<PathBuf, HardwareError> {
+        validate_source(source)?;
+        self.acquire_source(source)
+    }
+
     fn build_intent(
         &self,
         intent: &CorinthIntent,
@@ -1085,7 +1095,7 @@ impl HardwareProvisioner {
             generated_url = format!("https://crates.io/api/v1/crates/{package}/{version}/download");
             &generated_url
         };
-        if !self.allow_network || !is_crates_io_url(url) {
+        if !self.allow_network || !is_exact_crates_io_url(url, package, version) {
             return Err(HardwareError::InvalidSource(
                 "crates-io sources require the crates.io HTTPS download URL and network permission"
                     .into(),
@@ -1523,7 +1533,7 @@ fn validate_source(source: &RecipeSource) -> Result<(), HardwareError> {
                 || source
                     .url
                     .as_deref()
-                    .is_some_and(|url| !is_crates_io_url(url))
+                    .is_some_and(|url| !is_exact_crates_io_url(url, package, version))
             {
                 return Err(HardwareError::InvalidSource(
                     "crates.io source fields are not an immutable package lock".into(),
@@ -2639,10 +2649,9 @@ fn is_https_url(value: &str) -> bool {
     value.starts_with("https://") && !value.contains([' ', '\n', '\r', '\t'])
 }
 
-fn is_crates_io_url(value: &str) -> bool {
-    is_https_url(value)
-        && (value.starts_with("https://crates.io/")
-            || value.starts_with("https://static.crates.io/"))
+fn is_exact_crates_io_url(value: &str, package: &str, version: &str) -> bool {
+    value == format!("https://crates.io/api/v1/crates/{package}/{version}/download")
+        || value == format!("https://static.crates.io/crates/{package}/{package}-{version}.crate")
 }
 
 pub(crate) fn hex_digest(bytes: &[u8]) -> String {
@@ -2684,6 +2693,28 @@ mod tests {
         assert!(safe_source_destination("sources/push").is_ok());
         assert!(safe_source_destination("../push").is_err());
         assert!(safe_source_destination("target/push").is_err());
+    }
+
+    #[test]
+    fn crates_io_url_must_name_the_locked_package_and_version() {
+        let mut source = RecipeSource {
+            kind: "crates-io".into(),
+            url: Some("https://crates.io/api/v1/crates/demo/1.2.3/download".into()),
+            revision: None,
+            checksum: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+            package: Some("demo".into()),
+            version: Some("1.2.3".into()),
+            destination: None,
+            submodules: false,
+        };
+        assert!(validate_source(&source).is_ok());
+        source.url = Some("https://crates.io/api/v1/crates/other/1.2.3/download".into());
+        assert!(matches!(
+            validate_source(&source),
+            Err(HardwareError::InvalidSource(_))
+        ));
     }
 
     #[test]

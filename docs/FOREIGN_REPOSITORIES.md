@@ -8,6 +8,59 @@ outputs, sandbox policy, Driver ABI metadata, health checks, and rollback
 requirements. The generated recipe must then be measured and admitted by a
 signed Corinth or Arach-HWD package intent before it can be installed.
 
+## Unified signed ingress
+
+`corinth-ingest` replaces format-specific orchestration with one signed lock.
+The lock separates ecosystem semantics from transport. `arch`, `aur`, `crux`,
+and `nix` origins use a pinned HTTPS Git repository, a full 40-hex revision, a
+contained metadata path, and an exact metadata SHA-256. This includes GitHub
+repositories without making GitHub an authority. CRUX additionally binds the
+companion source lock. Metadata repositories cannot enable submodules; source
+submodules, when a generated recipe needs them, remain a separately measured
+recipe concern. `cargo` origins bind an exact crates.io version,
+checksum, package metadata, and dependency atoms.
+
+```toml
+format = 1
+ecosystem = "aur"
+package = "example"
+
+[origin]
+kind = "git"
+repository = "https://aur.archlinux.org/example.git"
+revision = "0123456789abcdef0123456789abcdef01234567"
+metadata_path = "PKGBUILD"
+metadata_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+submodules = false
+```
+
+```toml
+format = 1
+ecosystem = "cargo"
+package = "example"
+
+[origin]
+kind = "crates-io"
+version = "1.2.3"
+release = 1
+checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+summary = "Example Rust package"
+license = "MIT"
+architectures = ["x86-64"]
+depends = []
+makedepends = []
+provides = []
+conflicts = []
+```
+
+The complete ingress lock and target policy are independently verified with
+the `package-index` key scope. Corinth then proves source availability,
+remeasures metadata, translates through the static adapter, and writes both a
+canonical recipe and an ingress receipt. The receipt binds the signed lock,
+upstream metadata or crate archive evidence, recipe metadata, and recipe
+source-lock digests. It is
+evidence for repository admission, not installation authority by itself.
+
 ## Trust flow
 
 ```text
