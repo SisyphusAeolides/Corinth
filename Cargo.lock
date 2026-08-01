@@ -10,7 +10,7 @@ source = "git+https://github.com/SisyphusAeolides/Arach-Kernel.git?rev=8b1ca78d2
 [[package]]
 name = "arach-hwd"
 version = "0.1.0"
-source = "git+https://github.com/SisyphusAeolides/Arach-HWD.git?rev=c4f02c6d5ad06624b43058d3adbafadd69072fc8#c4f02c6d5ad06624b43058d3adbafadd69072fc8"
+source = "git+https://github.com/SisyphusAeolides/Arach-HWD.git?rev=8a02fa4a41d5e21b447a92414db23b4b706f3731#8a02fa4a41d5e21b447a92414db23b4b706f3731"
 dependencies = [
  "ed25519-dalek",
  "serde",
