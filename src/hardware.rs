@@ -20,9 +20,13 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 
-use arach_hwd::plan::{CorinthIntent, CorinthVerb, PLAN_SCHEMA, PlanSet, ProvisionPlan};
-use arach_hwd::profile::{PackageScope, RepositoryAuthority};
+use arach_hwd::facts::{CpuArchitecture, CpuFeature};
+use arach_hwd::plan::{
+    CompilerTarget, CorinthIntent, CorinthVerb, PLAN_SCHEMA, PlanSet, ProvisionPlan,
+};
+use arach_hwd::profile::{AbiVersion, CompilerPolicy, PackageScope, RepositoryAuthority};
 use arach_hwd::signature::Keyring;
 use serde::{Deserialize, Serialize};
 
@@ -139,7 +143,37 @@ pub struct RecipeHardware {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedHardwarePlan {
-    pub plan: ProvisionPlan,
+    pub(crate) plan: ProvisionPlan,
+}
+
+impl VerifiedHardwarePlan {
+    pub fn plan(&self) -> &ProvisionPlan {
+        &self.plan
+    }
+
+    /// Split an already-verified package set without permitting callers to
+    /// manufacture or mutate any authority-bearing plan field.
+    pub fn partition_packages<F>(&self, mut left: F) -> (Option<Self>, Option<Self>)
+    where
+        F: FnMut(&CorinthIntent) -> bool,
+    {
+        let mut left_package = Vec::new();
+        let mut right_package = Vec::new();
+        for intent in &self.plan.package {
+            if left(intent) {
+                left_package.push(intent.clone());
+            } else {
+                right_package.push(intent.clone());
+            }
+        }
+        let mut left_plan = self.plan.clone();
+        let mut right_plan = self.plan.clone();
+        left_plan.package = left_package;
+        right_plan.package = right_package;
+        let left = (!left_plan.package.is_empty()).then_some(Self { plan: left_plan });
+        let right = (!right_plan.package.is_empty()).then_some(Self { plan: right_plan });
+        (left, right)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -369,10 +403,98 @@ pub fn verify_plan(
             "package intents do not match the signed profile".into(),
         ));
     }
+    let running_abi = AbiVersion::from_str(&plan.driver_abi)
+        .map_err(|_| HardwareError::InvalidPlan("invalid running Driver ABI".into()))?;
+    let requires_driver_abi = verified
+        .profile()
+        .package
+        .iter()
+        .any(|package| matches!(package.scope, PackageScope::Driver | PackageScope::Firmware));
+    match verified.profile().driver_abi.as_ref() {
+        Some(range) => {
+            let minimum = AbiVersion::from_str(&range.minimum)
+                .map_err(|_| HardwareError::InvalidPlan("invalid profile Driver ABI".into()))?;
+            let maximum = AbiVersion::from_str(&range.maximum)
+                .map_err(|_| HardwareError::InvalidPlan("invalid profile Driver ABI".into()))?;
+            if running_abi < minimum || running_abi > maximum {
+                return Err(HardwareError::InvalidPlan(
+                    "running Driver ABI is outside the signed profile range".into(),
+                ));
+            }
+        }
+        None if requires_driver_abi => {
+            return Err(HardwareError::InvalidPlan(
+                "hardware profile does not authorize a Driver ABI".into(),
+            ));
+        }
+        None => {}
+    }
+    if plan.health != verified.profile().health
+        || plan.rollback != verified.profile().rollback
+        || plan.recovery != verified.profile().recovery
+    {
+        return Err(HardwareError::InvalidPlan(
+            "health, rollback, or recovery policy differs from the signed profile".into(),
+        ));
+    }
+    verify_compiler_target(&plan.compiler, verified.profile().compiler.as_ref())?;
     for intent in &plan.package {
         validate_intent(intent)?;
     }
     Ok(VerifiedHardwarePlan { plan })
+}
+
+fn verify_compiler_target(
+    target: &CompilerTarget,
+    policy: Option<&CompilerPolicy>,
+) -> Result<(), HardwareError> {
+    let observed = arach_hwd::scan::scan_system(Path::new("/sys")).cpu;
+    if target.architecture != observed.architecture
+        || target.vendor != observed.vendor
+        || target.family != observed.family
+        || target.model != observed.model
+        || target.stepping != observed.stepping
+    {
+        return Err(HardwareError::InvalidPlan(
+            "compiler target does not describe the local CPU".into(),
+        ));
+    }
+    let observed_features = observed.features.into_iter().collect::<BTreeSet<_>>();
+    let expected = if let Some(policy) = policy {
+        if policy.architecture != target.architecture {
+            return Err(HardwareError::InvalidPlan(
+                "compiler target architecture differs from signed policy".into(),
+            ));
+        }
+        if policy
+            .required_features
+            .iter()
+            .any(|feature| !observed_features.contains(feature))
+        {
+            return Err(HardwareError::InvalidPlan(
+                "local CPU lacks a feature required by signed policy".into(),
+            ));
+        }
+        policy
+            .allowed_features
+            .iter()
+            .copied()
+            .filter(|feature| observed_features.contains(feature))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if target.features != expected
+        || target
+            .features
+            .iter()
+            .any(|feature| !target.architecture.supports(*feature))
+    {
+        return Err(HardwareError::InvalidPlan(
+            "compiler features are not the exact observed signed-policy intersection".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verifies every plan in an HWD plan-set.  Duplicate devices or profiles
@@ -509,13 +631,16 @@ impl HardwareProvisioner {
         for plan in plans {
             for intent in &plan.plan.package {
                 let key = (intent.name.clone(), intent.version.clone());
-                if let Some(previous) = intents.insert(key.clone(), intent) {
+                if let Some((previous, previous_target)) =
+                    intents.insert(key.clone(), (intent, &plan.plan.compiler))
+                {
                     if previous.metadata_sha256 != intent.metadata_sha256
                         || previous.artifact_sha256 != intent.artifact_sha256
                         || previous.source_lock_sha256 != intent.source_lock_sha256
+                        || previous_target != &plan.plan.compiler
                     {
                         return Err(HardwareError::InvalidPlan(format!(
-                            "conflicting package intents across hardware plans: {}",
+                            "conflicting package intents or compiler targets across hardware plans: {}",
                             intent.name
                         )));
                     }
@@ -524,7 +649,7 @@ impl HardwareProvisioner {
         }
         intents
             .into_values()
-            .map(|intent| self.build_intent(intent, recipes_root))
+            .map(|(intent, compiler)| self.build_intent(intent, compiler, recipes_root))
             .collect()
     }
 
@@ -692,6 +817,7 @@ impl HardwareProvisioner {
     fn build_intent(
         &self,
         intent: &CorinthIntent,
+        compiler: &CompilerTarget,
         recipes_root: &Path,
     ) -> Result<HardwareBuildReceipt, HardwareError> {
         let recipe_path = find_recipe(recipes_root, &intent.name)?;
@@ -707,6 +833,11 @@ impl HardwareProvisioner {
         }
         let recipe = parse_recipe(&recipe_bytes)?;
         validate_recipe(&recipe, intent, &self.target_arch)?;
+        if compiler_architecture_name(compiler.architecture) != Some(self.target_arch.as_str()) {
+            return Err(HardwareError::InvalidPlan(
+                "compiler target architecture differs from the package target".into(),
+            ));
+        }
         let source_lock = source_lock_sha256(&recipe.source);
         if source_lock != intent.source_lock_sha256 {
             return Err(HardwareError::SourceLockDigestMismatch {
@@ -727,9 +858,9 @@ impl HardwareProvisioner {
         let materialized_sources = kernel_materialization_sources(&recipe)?;
         let source_dir = self.materialize_sources(&materialized_sources, &source_lock)?;
         if recipe.build.system == "cosmic" {
-            run_cosmic_workspace(&source_dir, recipe.policy.network)?;
+            run_cosmic_workspace(&source_dir, recipe.policy.network, compiler)?;
         } else if is_fixed_kernel_recipe(&recipe) {
-            run_arach_kernel_workspace(&source_dir, recipe.policy.network)?;
+            run_arach_kernel_workspace(&source_dir, recipe.policy.network, compiler)?;
         } else {
             for command in &recipe.build.commands {
                 run_build_command(
@@ -737,6 +868,7 @@ impl HardwareProvisioner {
                     &recipe.build.system,
                     &source_dir,
                     recipe.policy.network,
+                    compiler,
                 )?;
             }
         }
@@ -1550,7 +1682,11 @@ fn verify_download_checksum(path: &Path, expected: Option<&str>) -> Result<(), H
     Ok(())
 }
 
-fn run_arach_kernel_workspace(directory: &Path, network: bool) -> Result<(), HardwareError> {
+fn run_arach_kernel_workspace(
+    directory: &Path,
+    network: bool,
+    compiler: &CompilerTarget,
+) -> Result<(), HardwareError> {
     if network {
         return Err(HardwareError::BuildNetworkNotAllowed);
     }
@@ -1596,6 +1732,7 @@ fn run_arach_kernel_workspace(directory: &Path, network: bool) -> Result<(), Har
             "os-bin",
         ],
         &[("CARGO_TARGET_DIR", path_str(&push_target)?)],
+        compiler,
     )?;
     run_kernel_cargo(
         directory,
@@ -1615,6 +1752,7 @@ fn run_arach_kernel_workspace(directory: &Path, network: bool) -> Result<(), Har
             "build-std-features=compiler-builtins-mem",
         ],
         &[("CARGO_TARGET_DIR", path_str(&probe_target)?)],
+        compiler,
     )?;
 
     let push_image = push_target.join("x86_64-arach/release/push");
@@ -1649,6 +1787,7 @@ fn run_arach_kernel_workspace(directory: &Path, network: bool) -> Result<(), Har
             ("ARACH_BOOTSTRAP_IMAGE", path_str(&probe_image)?),
             ("ARACH_BOOTSTRAP_ABI", "linux"),
         ],
+        compiler,
     )?;
     require_nonempty_regular(
         &kernel_target.join("x86_64-arach/release/arach"),
@@ -1660,8 +1799,16 @@ fn run_kernel_cargo(
     directory: &Path,
     arguments: &[&str],
     environment: &[(&str, &str)],
+    compiler: &CompilerTarget,
 ) -> Result<(), HardwareError> {
-    let status = run_sandboxed("cargo", arguments, directory, false, environment)?;
+    let status = run_sandboxed(
+        "cargo",
+        arguments,
+        directory,
+        false,
+        environment,
+        Some(compiler),
+    )?;
     if status.success() {
         Ok(())
     } else {
@@ -1688,12 +1835,13 @@ fn run_build_command(
     system: &str,
     directory: &Path,
     network: bool,
+    compiler: &CompilerTarget,
 ) -> Result<(), HardwareError> {
     let argv = parse_command(command)?;
     if argv.is_empty() || !allowed_program(system, argv[0]) {
         return Err(HardwareError::CommandRejected(command.into()));
     }
-    let status = run_sandboxed(argv[0], &argv[1..], directory, network, &[])?;
+    let status = run_sandboxed(argv[0], &argv[1..], directory, network, &[], Some(compiler))?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(command.into()));
     }
@@ -1705,7 +1853,11 @@ fn run_build_command(
 /// Make builds and installs into a caller-owned root. Corinth does not accept
 /// arbitrary `just` commands; only the fixed `build` and `install` phases are
 /// reached from the `cosmic` recipe system.
-fn run_cosmic_workspace(directory: &Path, network: bool) -> Result<(), HardwareError> {
+fn run_cosmic_workspace(
+    directory: &Path,
+    network: bool,
+    compiler: &CompilerTarget,
+) -> Result<(), HardwareError> {
     let justfile = directory.join("justfile");
     let metadata = fs::symlink_metadata(&justfile)
         .map_err(|_| HardwareError::InvalidSource("COSMIC justfile is missing".into()))?;
@@ -1714,7 +1866,7 @@ fn run_cosmic_workspace(directory: &Path, network: bool) -> Result<(), HardwareE
             "COSMIC justfile is not a regular file".into(),
         ));
     }
-    run_cosmic_phase(directory, &["build"], network)?;
+    run_cosmic_phase(directory, &["build"], network, compiler)?;
     let install_root = directory.join(".corinth-install");
     if let Ok(existing) = fs::symlink_metadata(&install_root) {
         if existing.file_type().is_symlink() || !existing.is_dir() {
@@ -1726,7 +1878,12 @@ fn run_cosmic_workspace(directory: &Path, network: bool) -> Result<(), HardwareE
     }
     fs::create_dir(&install_root)?;
     let rootdir = format!("rootdir={}", install_root.display());
-    run_cosmic_phase(directory, &[&rootdir, "prefix=/usr", "install"], network)?;
+    run_cosmic_phase(
+        directory,
+        &[&rootdir, "prefix=/usr", "install"],
+        network,
+        compiler,
+    )?;
     install_cosmic_greeter_config(directory, &install_root)?;
     reject_symlinks(&install_root)
 }
@@ -1762,8 +1919,9 @@ fn run_cosmic_phase(
     directory: &Path,
     arguments: &[&str],
     network: bool,
+    compiler: &CompilerTarget,
 ) -> Result<(), HardwareError> {
-    let status = run_sandboxed("just", arguments, directory, network, &[])?;
+    let status = run_sandboxed("just", arguments, directory, network, &[], Some(compiler))?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(format!(
             "just {} failed",
@@ -1785,6 +1943,7 @@ fn run_sandboxed(
     directory: &Path,
     network: bool,
     environment: &[(&str, &str)],
+    compiler: Option<&CompilerTarget>,
 ) -> Result<std::process::ExitStatus, HardwareError> {
     validate_sandbox_backend()?;
     let source = fs::canonicalize(directory)
@@ -1807,6 +1966,9 @@ fn run_sandboxed(
         }
         command.args(["--setenv", name, value]);
     }
+    if let Some(compiler) = compiler {
+        append_compiler_environment(&mut command, compiler)?;
+    }
     command
         .arg("--")
         .arg(program)
@@ -1815,6 +1977,114 @@ fn run_sandboxed(
     command
         .status()
         .map_err(|error| HardwareError::CommandFailed(error.to_string()))
+}
+
+fn append_compiler_environment(
+    command: &mut Command,
+    target: &CompilerTarget,
+) -> Result<(), HardwareError> {
+    if target.features.windows(2).any(|pair| pair[0] >= pair[1])
+        || target
+            .features
+            .iter()
+            .any(|feature| !target.architecture.supports(*feature))
+    {
+        return Err(HardwareError::InvalidPlan(
+            "compiler target is not a canonical architecture capability set".into(),
+        ));
+    }
+
+    let (mut native_flags, rust_cpu) = match target.architecture {
+        CpuArchitecture::X86_64 => (String::from("-O2 -pipe -march=x86-64"), "x86-64"),
+        CpuArchitecture::Aarch64 => (String::from("-O2 -pipe -march=armv8-a"), "generic"),
+        CpuArchitecture::Riscv64 => (
+            String::from("-O2 -pipe -march=rv64gc -mabi=lp64d"),
+            "generic-rv64",
+        ),
+        CpuArchitecture::Unknown => {
+            return Err(HardwareError::InvalidPlan(
+                "unknown CPU architecture cannot authorize a native build".into(),
+            ));
+        }
+    };
+    let mut rust_features = Vec::with_capacity(target.features.len());
+    if target.architecture == CpuArchitecture::Aarch64 && !target.features.is_empty() {
+        native_flags.push('+');
+    }
+    for (index, feature) in target.features.iter().copied().enumerate() {
+        let (native, rust) = compiler_feature(target.architecture, feature)?;
+        if target.architecture == CpuArchitecture::Aarch64 {
+            if index > 0 {
+                native_flags.push('+');
+            }
+            native_flags.push_str(native);
+        } else {
+            native_flags.push(' ');
+            native_flags.push_str(native);
+        }
+        rust_features.push(rust);
+    }
+    let mut rust_flags = format!("-Ctarget-cpu={rust_cpu}");
+    if !rust_features.is_empty() {
+        rust_flags.push_str(" -Ctarget-feature=+");
+        rust_flags.push_str(&rust_features.join(",+"));
+    }
+    for name in ["CFLAGS", "CXXFLAGS", "FFLAGS"] {
+        command.args(["--setenv", name, native_flags.as_str()]);
+    }
+    command.args(["--setenv", "RUSTFLAGS", rust_flags.as_str()]);
+    Ok(())
+}
+
+fn compiler_feature(
+    architecture: CpuArchitecture,
+    feature: CpuFeature,
+) -> Result<(&'static str, &'static str), HardwareError> {
+    let flags = match (architecture, feature) {
+        (CpuArchitecture::X86_64, CpuFeature::Aes) => ("-maes", "aes"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx) => ("-mavx", "avx"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx2) => ("-mavx2", "avx2"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx512bw) => ("-mavx512bw", "avx512bw"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx512cd) => ("-mavx512cd", "avx512cd"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx512dq) => ("-mavx512dq", "avx512dq"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx512f) => ("-mavx512f", "avx512f"),
+        (CpuArchitecture::X86_64, CpuFeature::Avx512vl) => ("-mavx512vl", "avx512vl"),
+        (CpuArchitecture::X86_64, CpuFeature::Bmi1) => ("-mbmi", "bmi1"),
+        (CpuArchitecture::X86_64, CpuFeature::Bmi2) => ("-mbmi2", "bmi2"),
+        (CpuArchitecture::X86_64, CpuFeature::Fma) => ("-mfma", "fma"),
+        (CpuArchitecture::X86_64, CpuFeature::Fxsr) => ("-mfxsr", "fxsr"),
+        (CpuArchitecture::X86_64, CpuFeature::Lzcnt) => ("-mlzcnt", "lzcnt"),
+        (CpuArchitecture::X86_64, CpuFeature::Mmx) => ("-mmmx", "mmx"),
+        (CpuArchitecture::X86_64, CpuFeature::Pclmulqdq) => ("-mpclmul", "pclmulqdq"),
+        (CpuArchitecture::X86_64, CpuFeature::Popcnt) => ("-mpopcnt", "popcnt"),
+        (CpuArchitecture::X86_64, CpuFeature::Sse) => ("-msse", "sse"),
+        (CpuArchitecture::X86_64, CpuFeature::Sse2) => ("-msse2", "sse2"),
+        (CpuArchitecture::X86_64, CpuFeature::Sse3) => ("-msse3", "sse3"),
+        (CpuArchitecture::X86_64, CpuFeature::Sse41) => ("-msse4.1", "sse4.1"),
+        (CpuArchitecture::X86_64, CpuFeature::Sse42) => ("-msse4.2", "sse4.2"),
+        (CpuArchitecture::X86_64, CpuFeature::Ssse3) => ("-mssse3", "ssse3"),
+        (CpuArchitecture::Aarch64, CpuFeature::Aes) => ("aes", "aes"),
+        (CpuArchitecture::Aarch64, CpuFeature::Crc32) => ("crc", "crc"),
+        (CpuArchitecture::Aarch64, CpuFeature::Neon) => ("simd", "neon"),
+        (CpuArchitecture::Aarch64, CpuFeature::Sha2) => ("sha2", "sha2"),
+        (CpuArchitecture::Aarch64, CpuFeature::Sve) => ("sve", "sve"),
+        (CpuArchitecture::Aarch64, CpuFeature::Sve2) => ("sve2", "sve2"),
+        _ => {
+            return Err(HardwareError::InvalidPlan(
+                "compiler feature is not valid for the target architecture".into(),
+            ));
+        }
+    };
+    Ok(flags)
+}
+
+fn compiler_architecture_name(architecture: CpuArchitecture) -> Option<&'static str> {
+    match architecture {
+        CpuArchitecture::X86_64 => Some("x86-64"),
+        CpuArchitecture::Aarch64 => Some("aarch64"),
+        CpuArchitecture::Riscv64 => Some("riscv64"),
+        CpuArchitecture::Unknown => None,
+    }
 }
 
 fn validate_sandbox_backend() -> Result<(), HardwareError> {
@@ -2426,6 +2696,79 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn portable_compiler_target_is_bound_to_the_local_cpu() {
+        let cpu = arach_hwd::scan::scan_system(Path::new("/sys")).cpu;
+        let mut target = CompilerTarget {
+            architecture: cpu.architecture,
+            vendor: cpu.vendor,
+            family: cpu.family,
+            model: cpu.model,
+            stepping: cpu.stepping,
+            features: Vec::new(),
+        };
+        assert_eq!(verify_compiler_target(&target, None), Ok(()));
+        target.vendor.push_str("-forged");
+        assert!(matches!(
+            verify_compiler_target(&target, None),
+            Err(HardwareError::InvalidPlan(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compiler_environment_uses_only_typed_capabilities() {
+        let target = CompilerTarget {
+            architecture: CpuArchitecture::X86_64,
+            vendor: "ignored-as-command-input".into(),
+            family: Some(6),
+            model: Some(158),
+            stepping: Some(10),
+            features: vec![CpuFeature::Avx2, CpuFeature::Sse2],
+        };
+        let mut command = Command::new(SANDBOX_PROGRAM);
+        append_compiler_environment(&mut command, &target).unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.windows(3).any(|window| {
+            window
+                == [
+                    "--setenv",
+                    "CFLAGS",
+                    "-O2 -pipe -march=x86-64 -mavx2 -msse2",
+                ]
+        }));
+        assert!(arguments.windows(3).any(|window| {
+            window
+                == [
+                    "--setenv",
+                    "RUSTFLAGS",
+                    "-Ctarget-cpu=x86-64 -Ctarget-feature=+avx2,+sse2",
+                ]
+        }));
+        assert!(!arguments.iter().any(|value| value.contains(&target.vendor)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compiler_environment_rejects_noncanonical_features() {
+        let target = CompilerTarget {
+            architecture: CpuArchitecture::X86_64,
+            vendor: String::new(),
+            family: None,
+            model: None,
+            stepping: None,
+            features: vec![CpuFeature::Sse2, CpuFeature::Avx2],
+        };
+        assert!(matches!(
+            append_compiler_environment(&mut Command::new(SANDBOX_PROGRAM), &target),
+            Err(HardwareError::InvalidPlan(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn build_process_is_isolated_or_fails_without_an_output() {
         let root =
             std::env::temp_dir().join(format!("corinth-build-sandbox-{}", std::process::id()));
@@ -2442,6 +2785,7 @@ mod tests {
             &root,
             true,
             &[],
+            None,
         )
         .unwrap();
         if !status.success() {
@@ -2451,7 +2795,7 @@ mod tests {
         }
         assert_eq!(fs::read(root.join("sandbox-write")).unwrap(), b"sealed");
         assert!(
-            run_sandboxed("cargo", &["--version"], &root, true, &[])
+            run_sandboxed("cargo", &["--version"], &root, true, &[], None)
                 .unwrap()
                 .success()
         );

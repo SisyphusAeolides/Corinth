@@ -18,8 +18,8 @@ Agda proves that raw build sources cannot acquire system-driver authority.
 
 ## Current Arach OS integration
 
-The current Arach OS component lock pins Corinth
-`b4c1e0c4d7ba2dd5492179ccfad0b50f7ce285ec`.
+The Arach OS component lock is the authority for the exact Corinth revision
+used by a release.
 
 Arach-Packages validation fetches that exact revision and builds its declared
 native outputs rather than substituting a local checkout. Arach OS then
@@ -47,11 +47,13 @@ before the parent pointer can be restored.
 The host-store bridge can consume an Arach-HWD signed provisioning plan, fetch
 its exact source revision, run the selected recipe, measure every declared
 output, and publish only after the plan's artifact, metadata, and source-lock
-digests agree.
+digests agree. Plan verification reproduces the signed Driver ABI bounds,
+health checks, rollback policy, recovery policy, and CPU compiler policy; these
+fields cannot be changed after profile verification.
 
 ## Recipe build matrix
 
-Recipes use one locked source plus an explicit output list. Ordinary recipes do
+Recipes use one or more locked sources plus an explicit output list. Ordinary recipes do
 not invoke a shell; commands are tokenized, allow-listed, and executed with
 reproducibility and network policy applied. Every admitted build phase runs in
 a fresh bubblewrap boundary with a private process/session/IPC/UTS namespace,
@@ -60,6 +62,14 @@ and only its measured source tree writable. Offline recipes also receive an
 isolated network namespace. Corinth fails closed when this boundary is absent
 or mutable. The special `cosmic` adapter is a fixed compatibility boundary for
 the pinned upstream `justfile` and accepts only its build and install phases.
+
+For native builds, Corinth re-observes the local CPU and requires an exact
+match with HWD's architecture/vendor/family/model/stepping identity. It then
+recomputes the intersection of observed features and the signed profile's
+allowed feature set. Only closed typed capabilities are translated to
+`CFLAGS`, `CXXFLAGS`, `FFLAGS`, and `RUSTFLAGS` inside bubblewrap. Raw flags,
+model names, and vendor strings never become command input; absent compiler
+policy produces a portable architecture baseline.
 
 | Recipe system | Supported toolchain examples | Source inputs |
 | --- | --- | --- |

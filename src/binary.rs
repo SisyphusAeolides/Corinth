@@ -1547,6 +1547,7 @@ mod tests {
             artifact_sha256: package.artifact_sha256.clone(),
             source_lock_sha256: package.source_lock_sha256.clone(),
         };
+        let cpu = arach_hwd::scan::scan_system(std::path::Path::new("/sys")).cpu;
         let plan = VerifiedHardwarePlan {
             plan: ProvisionPlan {
                 schema: arach_hwd::plan::PLAN_SCHEMA,
@@ -1555,6 +1556,14 @@ mod tests {
                 signing_key_id: "hardware-key".into(),
                 device_key: "pci:0000:00:00.0".into(),
                 driver_abi: "1.0".into(),
+                compiler: arach_hwd::plan::CompilerTarget {
+                    architecture: cpu.architecture,
+                    vendor: cpu.vendor,
+                    family: cpu.family,
+                    model: cpu.model,
+                    stepping: cpu.stepping,
+                    features: Vec::new(),
+                },
                 package: vec![intent],
                 health: Vec::new(),
                 rollback: arach_hwd::profile::RollbackPolicy {
