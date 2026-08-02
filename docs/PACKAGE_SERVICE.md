@@ -20,13 +20,15 @@ one configured provider explicitly. Ecosystem namespaces such as
 `aur:PACKAGE` and `cargo:PACKAGE` are also accepted when more than one source
 catalog is configured.
 
-Signed native index format `2` and signed source catalogs may both retain
+Signed native index format `3` and signed source catalog format `2` may both retain
 multiple exact versions. An unversioned request selects the greatest
 publisher-assigned package `sequence`; Corinth deliberately does not compare
 foreign version syntaxes. Exact pins can select an older retained version for
 initial installation, while updates still reject any sequence lower than the
-installed receipt. Legacy native index format `1` remains readable as a
-single-version index with sequence zero.
+installed receipt. Native index format `2` remains readable as a dependency-free
+multi-version index, native format `1` remains readable as a single-version
+index with sequence zero, and source catalog format `1` remains readable
+without dependency metadata.
 
 ## Resolution contract
 
@@ -43,12 +45,28 @@ Resolution follows these rules:
 3. retain only candidates at the highest configured priority in that route;
 4. accept duplicate evidence only when the complete package identity agrees;
 5. report conflicting equal-priority providers as ambiguous;
-6. on update, retain the installed provider, route, and channel and enforce
+6. expand every signed runtime requirement into package and virtual-capability
+   providers from every authenticated repository;
+7. solve requirements, alternatives, exact retained-version sets, provides,
+   conflicts, and the fixed installed set as one bounded graph;
+8. reject cycles, ambiguity, unsatisfied clauses, and graph-capacity overflow
+   before downloading or mutating the target;
+9. on update, retain the installed provider, route, and channel and enforce
    monotonic service and provider generations plus package sequence.
 
 `remove` never searches an upstream repository. It uses the local service
 provenance receipt and the binary ownership receipt, verifies that they agree,
-and removes only unmodified files owned by that package.
+and removes only unmodified files owned by that package. It authenticates the
+metadata for the remaining installed set and refuses a removal that would
+leave another package's runtime requirement unsatisfied. Dependencies that
+become unreferenced are left installed for an explicit later removal; there is
+no implicit orphan garbage collection.
+
+Service receipt format `2` stores the exact signed requirements, provides, and
+conflicts selected at installation time. This keeps reverse-dependency checks
+local and prevents a repository from rewriting the installed closure without
+an update. Legacy receipt format `1` remains readable with an empty dependency
+closure, matching the dependency-free catalog formats that produced it.
 
 ## Signed service configuration
 
@@ -109,7 +127,7 @@ package; the largest monotonic `sequence` is the default for the configured
 channel.
 
 ```toml
-format = 1
+format = 2
 key_id = "0123456789abcdef0123456789abcdef"
 name = "curated-aur"
 channel = "stable"
@@ -133,7 +151,29 @@ target_signature = "https://packages.arach.example/source/example.target.toml.si
 target_signature_sha256 = "<64 lowercase hex characters>"
 recipe_sha256 = "<64 lowercase hex characters>"
 source_lock_sha256 = "<64 lowercase hex characters>"
+
+[[package.requirements]]
+
+[[package.requirements.alternatives]]
+name = "ssl-api"
+versions = ["3"]
+
+[[package.provides]]
+name = "example-api"
+version = "1.2.3"
+
+[[package.conflicts]]
+name = "example-legacy"
+versions = []
 ```
+
+Each `requirements` entry is one clause and must have at least one
+`alternatives` entry. A constraint can name a concrete package or a capability
+declared by `provides`. An empty `versions` list accepts any retained version.
+Repository publication converts each ecosystem's native range semantics into
+a sorted set of exact versions retained by that signed snapshot; the client
+does not pretend that Arch, Nix, Cargo, Debian, and RPM versions share one
+comparison algorithm.
 
 Both the immutable ingress lock and target policy carry their own
 package-index signatures. Corinth then checks out the exact Git commit or
@@ -146,11 +186,12 @@ a native binary package. Package-service builds expose only OS-managed
 toolchains under `/usr`; mutable per-user Cargo, Rustup, Idris, and Agda
 installations and caches are not mounted into the build sandbox.
 
-The current source-service transaction admits only recipes with empty build
-and runtime dependency lists. A source entry with dependencies fails closed
-until Corinth's dependency solver can resolve and journal the complete graph as
-one transaction. Native packages and already self-contained source recipes are
-unaffected by this boundary.
+Source recipes may carry runtime dependency, capability, and conflict atoms
+when the signed catalog metadata agrees with the regenerated canonical recipe.
+Those runtime requirements enter the same solver and graph journal as native
+packages. Source build dependencies still fail closed: they require a separate
+isolated build-root graph so build tools cannot be confused with packages
+published into the target root.
 
 Arch and AUR locks parse static PKGBUILD metadata; CRUX locks bind both a
 Pkgfile and source manifest; Nix locks consume fixed-output exports; Cargo
@@ -161,10 +202,24 @@ Arach-HWD device plan.
 
 ## Transaction recovery
 
-Lifecycle operations take an exclusive lock and write a synchronized journal
-before target mutation. The service provenance receipt and binary ownership
-receipt are independent. On restart, Corinth compares the journal's old and
-new sides with actual binary ownership and restores the matching provenance
-state. An interrupted update that matches neither side fails closed instead of
-guessing. Target-file conflicts, modified owned files, build failures, and
-download failures leave the previous installation intact.
+Lifecycle operations take an exclusive lock. Install and update first solve the
+complete bounded closure and prepare every selected payload without target
+mutation. Existing packages are fixed; an update replaces only its requested
+root and may add missing dependencies, so it never performs surprise
+dependency upgrades. New dependencies are ordered before the root, and the
+root is always the final graph entry.
+
+Corinth then writes one synchronized graph journal before the first provenance
+or target mutation. The service provenance receipts and binary ownership
+receipts remain independent. On restart, a graph whose every ownership receipt
+matches the new side rolls forward. A partial install, or a partial update whose
+root still matches the old side, removes newly owned dependencies in reverse
+order and restores the old receipt set. A partial update with a committed new
+root, foreign ownership, or ownership that matches neither side fails closed
+instead of guessing.
+
+The solver admits at most 256 candidate records, 1,024 clauses, and 15 concrete
+providers in any one dependency clause. Repository publication must split or
+pre-resolve larger domains. Target-file conflicts, modified owned files, build
+failures, download failures, cycles, and unsatisfied constraints leave the
+previous installation intact.

@@ -108,9 +108,17 @@ for deterministic defaults; `PACKAGE@VERSION` is an exact pin. Equal-priority
 conflicts fail as ambiguous; `PROVIDER:PACKAGE` is the explicit override.
 Updates retain the installed provider and channel and reject lower service,
 repository, or package sequences. Removal is entirely receipt-driven and
-offline. Signed source entries run the complete immutable-lock, target-policy,
-canonical recipe, sandboxed build, measurement, ownership, and
-recovery-journal path.
+offline after it verifies that no remaining package requires the target.
+
+Every standard install and update solves signed runtime requirements,
+alternatives, exact retained-version sets, virtual capabilities, and conflicts
+against the fixed installed set. Corinth prepares the dependency-first closure,
+writes one graph journal, installs new dependencies, and commits the requested
+root last. Interrupted partial graphs roll back when the root is absent or
+still old; fully owned graphs roll forward. Signed source entries run the same
+graph boundary after the immutable-lock, target-policy, canonical recipe,
+sandboxed build, and measurement checks. Source build dependencies remain
+blocked until they can run through a separate isolated build-root graph.
 The configuration and source-catalog formats are documented in
 [`docs/PACKAGE_SERVICE.md`](docs/PACKAGE_SERVICE.md).
 

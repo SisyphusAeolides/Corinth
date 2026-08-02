@@ -5,10 +5,10 @@ index is TOML payload signed by an Arach-HWD key whose scope is exactly
 `package-index`; a hardware-profile key cannot authorize a native package
 index.
 
-The current index format is version `2`:
+The current index format is version `3`:
 
 ```toml
-format = 2
+format = 3
 repository = "arach-native"
 key_id = "native-index-2026"
 
@@ -24,25 +24,44 @@ artifact_sha256 = "<64 hex characters>"
 source_lock_sha256 = "<64 hex characters>"
 url = "https://packages.arach.example/stable/x86-64/cosmic-session.pkg"
 size = 123456
+
+[[package.requirements]]
+
+[[package.requirements.alternatives]]
+name = "wayland-api"
+versions = ["1"]
+
+[[package.provides]]
+name = "desktop-session"
+version = "1"
+
+[[package.conflicts]]
+name = "cosmic-session-legacy"
+versions = []
 ```
 
 Corinth validates the complete record before it downloads anything: package
 identity, authority/scope, HTTPS-only transport, bounded size, and all three
 digests. The detached signature must identify the same `key_id` in the index.
-Version `2` may retain several exact versions of one package. Every record has
+Version `3` may retain several exact versions of one package. Every record has
 a nonzero publisher-assigned `sequence`; both `(name, version)` and
 `(name, sequence)` must be unique. With no version selector Corinth chooses
 the record with the greatest sequence. `PACKAGE@VERSION` pins one exact
 version, independent of record order. Corinth does not infer precedence from
 ecosystem-specific version strings, and an update cannot move below the
-installed package sequence.
+installed package sequence. Requirements are clauses of concrete-package or
+virtual-capability alternatives. Version sets contain exact versions admitted
+by the signed snapshot; an empty set accepts any retained version. Provides and
+conflicts use the same bounded exact-constraint vocabulary.
 
-Version `1` indexes remain readable. Their package records omit `sequence`,
-which defaults to zero, and they retain the original one-record-per-name rule.
-New repository publications should use version `2`. One release is currently
-admitted for each `(name, version)` identity; a repository publishes a changed
-release by advancing both its package sequence and provider generation, while
-retaining both releases requires distinct version labels.
+Version `2` indexes remain readable as multi-version indexes but cannot carry
+dependency metadata. Version `1` indexes also remain readable; their package
+records omit `sequence`, which defaults to zero, and retain the original
+one-record-per-name rule. New repository publications should use version `3`.
+One release is currently admitted for each `(name, version)` identity; a
+repository publishes a changed release by advancing both its package sequence
+and provider generation, while retaining both releases requires distinct
+version labels.
 
 ## CLI
 
@@ -64,6 +83,12 @@ corinth install cosmic-session \
   --root / \
   --allow-network
 ```
+
+The explicit index form is intentionally one-record-only. It rejects a
+format-3 record carrying requirements, provides, or conflicts because it has no
+signed service graph. Dependency-bearing system records must enter through the
+ordinary service command; dependency-bearing driver or firmware records remain
+unsupported until the HWD plan format carries an equivalent complete graph.
 
 `--allow-network` is required only when the exact artifact is not already in
 the private artifact cache. A cached artifact is rechecked for both size and

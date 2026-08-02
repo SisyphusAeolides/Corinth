@@ -15,7 +15,7 @@ use arach_hwd::scan::scan_system;
 use arach_hwd::signature::Keyring;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -28,7 +28,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::arch_import::{RecipeTargetPolicy, parse_target_policy};
 use crate::binary::{
     BinaryInstallReceipt, BinaryInstallStore, BinaryProvisioner, VerifiedBinaryIndex,
-    select_binary_package, verify_binary_index,
+    verify_binary_index,
+};
+use crate::dependency::{
+    DependencyError, PackageCapability, PackageConstraint, PackageRequirement, ResolutionCandidate,
+    candidate_satisfies, package_satisfies_constraint, solve_dependency_graph,
+    validate_dependency_metadata,
 };
 use crate::hardware::{
     HardwareError, HardwareProvisioner, atomic_write, metadata_sha256, prepare_private_root,
@@ -39,9 +44,12 @@ use crate::universal_import::{
 };
 
 pub const SERVICE_CONFIG_FORMAT: u32 = 1;
-pub const SOURCE_CATALOG_FORMAT: u32 = 1;
-pub const SERVICE_RECEIPT_FORMAT: u32 = 1;
+pub const LEGACY_SOURCE_CATALOG_FORMAT: u32 = 1;
+pub const SOURCE_CATALOG_FORMAT: u32 = 2;
+pub const LEGACY_SERVICE_RECEIPT_FORMAT: u32 = 1;
+pub const SERVICE_RECEIPT_FORMAT: u32 = 2;
 const SERVICE_JOURNAL_FORMAT: u32 = 1;
+const SERVICE_GRAPH_JOURNAL_FORMAT: u32 = 1;
 const MAX_SERVICE_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_PROVIDER_COUNT: usize = 256;
@@ -122,6 +130,12 @@ pub struct SourceCatalogPackage {
     pub version: String,
     pub release: u32,
     pub sequence: u64,
+    #[serde(default)]
+    pub requirements: Vec<PackageRequirement>,
+    #[serde(default)]
+    pub provides: Vec<PackageCapability>,
+    #[serde(default)]
+    pub conflicts: Vec<PackageConstraint>,
     pub ecosystem: UniversalEcosystem,
     pub architectures: Vec<String>,
     pub ingress_lock: String,
@@ -149,8 +163,33 @@ pub struct ServiceReceipt {
     pub service_config_sha256: String,
     pub provider_generation: u64,
     pub package_sequence: u64,
+    #[serde(default)]
+    pub requirements: Vec<PackageRequirement>,
+    #[serde(default)]
+    pub provides: Vec<PackageCapability>,
+    #[serde(default)]
+    pub conflicts: Vec<PackageConstraint>,
     pub artifact_sha256: String,
     pub origin: ServiceOrigin,
+}
+
+impl ServiceReceipt {
+    fn dependency_metadata(&self) -> crate::dependency::DependencyMetadata {
+        crate::dependency::DependencyMetadata {
+            requirements: self.requirements.clone(),
+            provides: self.provides.clone(),
+            conflicts: self.conflicts.clone(),
+        }
+    }
+
+    fn solver_candidate(&self) -> ResolutionCandidate {
+        ResolutionCandidate {
+            package: self.package.clone(),
+            version: self.version.clone(),
+            sequence: self.package_sequence,
+            metadata: self.dependency_metadata(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,6 +253,7 @@ pub enum ServiceError {
     Provider(String),
     PackageNotFound(String),
     Ambiguous(Vec<String>),
+    Dependency(String),
     State(String),
     Downgrade(String),
     Transaction(String),
@@ -236,6 +276,7 @@ impl fmt::Display for ServiceError {
                 "ambiguous package providers: {}",
                 values.join(", ")
             ),
+            Self::Dependency(value) => write!(formatter, "dependency resolution failed: {value}"),
             Self::State(value) => write!(formatter, "package state error: {value}"),
             Self::Downgrade(value) => write!(formatter, "downgrade rejected: {value}"),
             Self::Transaction(value) => write!(formatter, "transaction recovery failed: {value}"),
@@ -252,6 +293,12 @@ impl From<HardwareError> for ServiceError {
     }
 }
 
+impl From<DependencyError> for ServiceError {
+    fn from(error: DependencyError) -> Self {
+        Self::Dependency(error.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PackageSelector {
     namespace: Option<String>,
@@ -259,21 +306,29 @@ struct PackageSelector {
     version: Option<String>,
 }
 
+#[derive(Clone)]
 enum ResolvedPackage {
     Native(Box<NativeCandidate>),
     Source(Box<SourceCandidate>),
 }
 
+#[derive(Clone)]
 struct NativeCandidate {
     repository: NativeRepository,
     verified: VerifiedBinaryIndex,
     record_index: usize,
 }
 
+#[derive(Clone)]
 struct SourceCandidate {
     repository: SourceRepository,
     catalog_sha256: String,
     package: SourceCatalogPackage,
+}
+
+struct ResolvedDependencyPlan {
+    order: Vec<ResolvedPackage>,
+    installed: BTreeMap<String, ServiceReceipt>,
 }
 
 impl ResolvedPackage {
@@ -359,25 +414,70 @@ impl ResolvedPackage {
             Self::Native(candidate) => {
                 let package = candidate.record();
                 format!(
-                    "native:{}:{}:{}:{}:{}:{}",
+                    "native:{}:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}",
                     package.version,
                     package.release,
                     package.sequence,
                     package.artifact_sha256,
                     package.metadata_sha256,
-                    package.source_lock_sha256
+                    package.source_lock_sha256,
+                    package.requirements,
+                    package.provides,
+                    package.conflicts
                 )
             }
             Self::Source(candidate) => format!(
-                "source:{}:{}:{}:{}:{}:{}",
+                "source:{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}",
                 candidate.package.ecosystem.name(),
                 candidate.package.version,
                 candidate.package.release,
                 candidate.package.sequence,
                 candidate.package.ingress_lock_sha256,
-                candidate.package.target_policy_sha256
+                candidate.package.target_policy_sha256,
+                candidate.package.recipe_sha256,
+                candidate.package.requirements,
+                candidate.package.provides,
+                candidate.package.conflicts
             ),
         }
+    }
+
+    fn dependency_metadata(&self) -> crate::dependency::DependencyMetadata {
+        match self {
+            Self::Native(candidate) => {
+                let package = candidate.record();
+                crate::dependency::DependencyMetadata {
+                    requirements: package.requirements.clone(),
+                    provides: package.provides.clone(),
+                    conflicts: package.conflicts.clone(),
+                }
+            }
+            Self::Source(candidate) => crate::dependency::DependencyMetadata {
+                requirements: candidate.package.requirements.clone(),
+                provides: candidate.package.provides.clone(),
+                conflicts: candidate.package.conflicts.clone(),
+            },
+        }
+    }
+
+    fn solver_candidate(&self) -> ResolutionCandidate {
+        ResolutionCandidate {
+            package: self.package().into(),
+            version: self.version().into(),
+            sequence: self.package_sequence(),
+            metadata: self.dependency_metadata(),
+        }
+    }
+
+    fn graph_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.route(),
+            self.provider(),
+            self.package(),
+            self.version(),
+            self.package_sequence()
+        )
     }
 
     fn summary(&self) -> ResolutionSummary {
@@ -491,6 +591,7 @@ impl PackageService {
                 )
             })?;
         ensure_binary_matches_service(&binary, &old)?;
+        self.ensure_removal_safe(&old.package)?;
         let journal = ServiceJournal {
             format: SERVICE_JOURNAL_FORMAT,
             action: JournalAction::Remove,
@@ -588,123 +689,159 @@ impl PackageService {
                 &self.config_sha256,
             )?;
         }
-        let prepared = self.prepare_candidate(resolved)?;
-        let new = prepared.receipt;
-        if let Some(old) = &old
-            && old == &new
-        {
+        self.lifecycle_dependency_graph(resolved, old, update, &binary_store)
+    }
+
+    fn lifecycle_dependency_graph(
+        &self,
+        root: ResolvedPackage,
+        old: Option<ServiceReceipt>,
+        update: bool,
+        binary_store: &BinaryInstallStore,
+    ) -> Result<LifecycleResult, ServiceError> {
+        let root_package = root.package().to_string();
+        let plan = self.resolve_dependency_plan(root, update)?;
+        let mut entries = Vec::new();
+        for candidate in plan.order {
+            let package = candidate.package().to_string();
+            let previous = if package == root_package {
+                old.clone()
+            } else {
+                plan.installed.get(&package).cloned()
+            };
+            if package != root_package
+                && let Some(receipt) = &previous
+            {
+                let binary = binary_store.installed_receipt(&package)?.ok_or_else(|| {
+                    ServiceError::State(format!(
+                        "dependency receipt exists without binary ownership: {package}"
+                    ))
+                })?;
+                ensure_binary_matches_service(&binary, receipt)?;
+                continue;
+            }
+            let prepared = self.prepare_candidate(candidate)?;
+            let mutate_binary = previous.as_ref().is_none_or(|receipt| {
+                receipt.package != prepared.receipt.package
+                    || receipt.version != prepared.receipt.version
+                    || receipt.release != prepared.receipt.release
+                    || receipt.artifact_sha256 != prepared.receipt.artifact_sha256
+            });
+            entries.push(PreparedGraphEntry {
+                old: previous,
+                prepared,
+                mutate_binary,
+            });
+        }
+        let root_position = entries
+            .iter()
+            .position(|entry| entry.prepared.receipt.package == root_package)
+            .ok_or_else(|| ServiceError::Dependency("root package was not selected".into()))?;
+        let root_entry = entries.remove(root_position);
+        entries.push(root_entry);
+        let root_receipt = entries
+            .last()
+            .map(|entry| entry.prepared.receipt.clone())
+            .ok_or_else(|| ServiceError::Dependency("dependency plan is empty".into()))?;
+        let changed = entries.iter().any(|entry| {
+            entry
+                .old
+                .as_ref()
+                .is_none_or(|old| old != &entry.prepared.receipt)
+        });
+        if !changed {
             return Ok(result_from_receipt(
                 if update { "update" } else { "install" },
-                old,
+                &root_receipt,
                 false,
             ));
         }
-        if let Some(old) = &old
-            && old.artifact_sha256 == new.artifact_sha256
-            && old.package == new.package
-            && old.version == new.version
-            && old.release == new.release
-        {
-            self.write_service_receipt(&new)?;
-            return Ok(result_from_receipt("update", &new, false));
-        }
 
-        let journal = ServiceJournal {
-            format: SERVICE_JOURNAL_FORMAT,
+        let journal = ServiceGraphJournal {
+            format: SERVICE_GRAPH_JOURNAL_FORMAT,
             action: if update {
                 JournalAction::Update
             } else {
                 JournalAction::Install
             },
-            package: selector.name,
-            old: old.clone(),
-            new: Some(new.clone()),
+            root: root_package,
+            entries: entries
+                .iter()
+                .map(|entry| ServiceGraphJournalEntry {
+                    package: entry.prepared.receipt.package.clone(),
+                    old: entry.old.clone(),
+                    new: entry.prepared.receipt.clone(),
+                })
+                .collect(),
         };
-        self.write_journal(&journal)?;
-        self.write_service_receipt(&new)?;
-        let operation = match prepared.payload {
-            PreparedPayload::Native {
-                provisioner,
-                verified,
-            } => {
-                if update {
-                    provisioner
-                        .update_to_root(
-                            self.config.state.clone(),
-                            self.config.root.clone(),
-                            &verified,
-                            &new.package,
-                            Some(&new.version),
-                        )
-                        .map(|_| ())
-                } else {
-                    provisioner
-                        .install_to_root(
-                            self.config.state.clone(),
-                            self.config.root.clone(),
-                            &verified,
-                            &new.package,
-                            Some(&new.version),
-                        )
-                        .map(|_| ())
+        self.write_graph_journal(&journal)?;
+        let mut applied = Vec::new();
+        let operation = (|| {
+            for (index, entry) in entries.iter().enumerate() {
+                self.write_service_receipt(&entry.prepared.receipt)?;
+                if !entry.mutate_binary {
+                    continue;
+                }
+                match binary_store.install_payload(
+                    &entry.prepared.payload,
+                    &entry.prepared.receipt.artifact_sha256,
+                    entry.old.is_some(),
+                ) {
+                    Ok(_) => applied.push(index),
+                    Err(error) => {
+                        let binary =
+                            binary_store.installed_receipt(&entry.prepared.receipt.package)?;
+                        if binary.as_ref().is_some_and(|binary| {
+                            binary_matches_service(binary, &entry.prepared.receipt)
+                        }) {
+                            applied.push(index);
+                            continue;
+                        }
+                        return Err(ServiceError::from(error));
+                    }
                 }
             }
-            PreparedPayload::Source(payload) => binary_store
-                .install_payload(&payload, &new.artifact_sha256, update)
-                .map(|_| ()),
-        };
+            Ok::<(), ServiceError>(())
+        })();
         if let Err(error) = operation {
-            match binary_store.installed_receipt(&new.package) {
-                Ok(Some(binary)) if binary_matches_service(&binary, &new) => {
-                    self.write_service_receipt(&new)?;
-                    self.clear_journal()?;
-                    return Ok(result_from_receipt(
-                        if update { "update" } else { "install" },
-                        &new,
-                        true,
-                    ));
-                }
-                Ok(Some(binary))
-                    if old
-                        .as_ref()
-                        .is_some_and(|receipt| binary_matches_service(&binary, receipt)) =>
-                {
-                    self.write_service_receipt(old.as_ref().ok_or_else(|| {
-                        ServiceError::Transaction(
-                            "old ownership exists without an old journal receipt".into(),
-                        )
-                    })?)?;
-                    self.clear_journal()?;
-                    return Err(error.into());
-                }
-                Ok(None) if old.is_none() => {
-                    self.remove_service_receipt(&new.package)?;
-                    self.clear_journal()?;
-                    return Err(error.into());
-                }
-                Ok(None) => {
-                    return Err(ServiceError::Transaction(format!(
-                        "update failed and lost both ownership states: {error}"
-                    )));
-                }
-                Ok(Some(_)) => {
-                    return Err(ServiceError::Transaction(format!(
-                        "package operation failed and binary ownership matches neither journal state: {error}"
-                    )));
-                }
-                Err(inspect) => {
-                    return Err(ServiceError::Transaction(format!(
-                        "package operation failed ({error}) and ownership could not be inspected: {inspect}"
-                    )));
-                }
+            if let Err(rollback) = self.rollback_graph_entries(&entries, &applied, binary_store) {
+                return Err(ServiceError::Transaction(format!(
+                    "package graph failed ({error}) and rollback failed: {rollback}"
+                )));
             }
+            return Err(error);
         }
-        self.clear_journal()?;
+        self.clear_graph_journal()?;
         Ok(result_from_receipt(
             if update { "update" } else { "install" },
-            &new,
+            &root_receipt,
             true,
         ))
+    }
+
+    fn rollback_graph_entries(
+        &self,
+        entries: &[PreparedGraphEntry],
+        applied: &[usize],
+        binary_store: &BinaryInstallStore,
+    ) -> Result<(), ServiceError> {
+        for index in applied.iter().rev() {
+            let entry = &entries[*index];
+            if entry.old.is_some() {
+                return Err(ServiceError::Transaction(
+                    "a committed graph update cannot be reversed after a later failure".into(),
+                ));
+            }
+            binary_store.remove(&entry.prepared.receipt.package)?;
+        }
+        for entry in entries {
+            if let Some(old) = &entry.old {
+                self.write_service_receipt(old)?;
+            } else {
+                self.remove_service_receipt(&entry.prepared.receipt.package)?;
+            }
+        }
+        self.clear_graph_journal()
     }
 
     fn resolve(
@@ -712,6 +849,192 @@ impl PackageService {
         selector: &PackageSelector,
         installed: Option<&ServiceReceipt>,
     ) -> Result<ResolvedPackage, ServiceError> {
+        let mut domain = self.resolve_domain(selector, installed)?;
+        domain
+            .pop()
+            .ok_or_else(|| ServiceError::PackageNotFound(selector.name.clone()))
+    }
+
+    fn resolve_domain(
+        &self,
+        selector: &PackageSelector,
+        installed: Option<&ServiceReceipt>,
+    ) -> Result<Vec<ResolvedPackage>, ServiceError> {
+        let mut candidates = self.collect_candidates(selector)?;
+        self.choose_domain(&mut candidates, selector, installed)
+    }
+
+    fn resolve_constraint_domain(
+        &self,
+        constraint: &PackageConstraint,
+    ) -> Result<Vec<ResolvedPackage>, ServiceError> {
+        let selector = PackageSelector {
+            namespace: None,
+            name: constraint.name.clone(),
+            version: None,
+        };
+        let mut candidates = self.collect_candidates_for_constraint(constraint)?;
+        self.choose_domain(&mut candidates, &selector, None)
+    }
+
+    fn resolve_installed_candidate(
+        &self,
+        receipt: &ServiceReceipt,
+    ) -> Result<ResolvedPackage, ServiceError> {
+        let selector = PackageSelector {
+            namespace: None,
+            name: receipt.package.clone(),
+            version: Some(receipt.version.clone()),
+        };
+        self.resolve_domain(&selector, Some(receipt))?
+            .into_iter()
+            .find(|candidate| {
+                candidate.package_sequence() == receipt.package_sequence
+                    && candidate.release() == receipt.release
+                    && candidate.provider() == receipt.provider
+                    && candidate.channel() == receipt.channel
+                    && candidate.route() == receipt.origin.route_name()
+                    && candidate.dependency_metadata() == receipt.dependency_metadata()
+            })
+            .ok_or_else(|| {
+                ServiceError::State(format!(
+                    "installed package is not retained by its signed provider: {}",
+                    receipt.package
+                ))
+            })
+    }
+
+    fn ensure_removal_safe(&self, package: &str) -> Result<(), ServiceError> {
+        let installed = self.read_all_service_receipts()?;
+        let remaining = installed
+            .values()
+            .filter(|receipt| receipt.package != package)
+            .map(ServiceReceipt::solver_candidate)
+            .collect::<Vec<_>>();
+        for candidate in &remaining {
+            for requirement in &candidate.metadata.requirements {
+                if !requirement.alternatives.iter().any(|constraint| {
+                    remaining
+                        .iter()
+                        .any(|provider| candidate_satisfies(provider, constraint))
+                }) {
+                    return Err(ServiceError::Dependency(format!(
+                        "cannot remove {package}: required by {}",
+                        candidate.package
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn choose_domain(
+        &self,
+        candidates: &mut Vec<ResolvedPackage>,
+        selector: &PackageSelector,
+        installed: Option<&ServiceReceipt>,
+    ) -> Result<Vec<ResolvedPackage>, ServiceError> {
+        if let Some(receipt) = installed {
+            candidates.retain(|candidate| {
+                candidate.package() == receipt.package
+                    && candidate.provider() == receipt.provider
+                    && candidate.channel() == receipt.channel
+                    && candidate.route() == receipt.origin.route_name()
+            });
+        } else if let Some(namespace) = selector.namespace.as_deref() {
+            candidates.retain(|candidate| candidate.namespace_matches(namespace));
+        } else if candidates
+            .iter()
+            .any(|candidate| matches!(candidate, ResolvedPackage::Native(_)))
+        {
+            candidates.retain(|candidate| matches!(candidate, ResolvedPackage::Native(_)));
+        }
+        if candidates.is_empty() {
+            return Err(ServiceError::PackageNotFound(selector.name.clone()));
+        }
+        let highest = candidates
+            .iter()
+            .map(ResolvedPackage::priority)
+            .max()
+            .ok_or_else(|| ServiceError::PackageNotFound(selector.name.clone()))?;
+        candidates.retain(|candidate| candidate.priority() == highest);
+
+        let mut providers = std::collections::BTreeMap::<String, Vec<ResolvedPackage>>::new();
+        for candidate in candidates.drain(..) {
+            providers
+                .entry(candidate.provider().into())
+                .or_default()
+                .push(candidate);
+        }
+        let identities = providers
+            .values()
+            .map(|domain| {
+                let mut identities = domain
+                    .iter()
+                    .map(ResolvedPackage::identity)
+                    .collect::<Vec<_>>();
+                identities.sort();
+                identities
+            })
+            .collect::<BTreeSet<_>>();
+        if identities.len() != 1 {
+            let mut conflicts = providers
+                .iter()
+                .flat_map(|(provider, domain)| {
+                    domain.iter().map(move |candidate| {
+                        format!(
+                            "{}:{}-{}",
+                            provider,
+                            candidate.package(),
+                            candidate.version()
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            conflicts.sort();
+            conflicts.dedup();
+            return Err(ServiceError::Ambiguous(conflicts));
+        }
+        let provider = providers
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| ServiceError::PackageNotFound(selector.name.clone()))?;
+        let mut domain = providers
+            .remove(&provider)
+            .ok_or_else(|| ServiceError::PackageNotFound(selector.name.clone()))?;
+        domain.sort_by(|left, right| {
+            left.package_sequence()
+                .cmp(&right.package_sequence())
+                .then(left.version().cmp(right.version()))
+        });
+        Ok(domain)
+    }
+
+    fn collect_candidates(
+        &self,
+        selector: &PackageSelector,
+    ) -> Result<Vec<ResolvedPackage>, ServiceError> {
+        self.collect_candidate_query(selector, None)
+    }
+
+    fn collect_candidates_for_constraint(
+        &self,
+        constraint: &PackageConstraint,
+    ) -> Result<Vec<ResolvedPackage>, ServiceError> {
+        let selector = PackageSelector {
+            namespace: None,
+            name: constraint.name.clone(),
+            version: None,
+        };
+        self.collect_candidate_query(&selector, Some(constraint))
+    }
+
+    fn collect_candidate_query(
+        &self,
+        selector: &PackageSelector,
+        constraint: Option<&PackageConstraint>,
+    ) -> Result<Vec<ResolvedPackage>, ServiceError> {
         let mut candidates = Vec::new();
         for repository in &self.config.native_repositories {
             let index_bytes = self.fetch_resource(
@@ -734,13 +1057,37 @@ impl PackageService {
                     repository.name
                 )));
             }
-            if let Some((record_index, package)) =
-                select_binary_package(&verified.index, &selector.name, selector.version.as_deref())
-                && package.scope == PackageScope::System
-            {
+            let record_indexes = verified
+                .index
+                .packages
+                .iter()
+                .enumerate()
+                .filter(|(_, package)| {
+                    package.scope == PackageScope::System
+                        && constraint.map_or_else(
+                            || {
+                                package.name == selector.name
+                                    && selector
+                                        .version
+                                        .as_deref()
+                                        .is_none_or(|version| package.version == version)
+                            },
+                            |constraint| {
+                                package_satisfies_constraint(
+                                    &package.name,
+                                    &package.version,
+                                    &package.provides,
+                                    constraint,
+                                )
+                            },
+                        )
+                })
+                .map(|(record_index, _)| record_index)
+                .collect::<Vec<_>>();
+            for record_index in record_indexes {
                 candidates.push(ResolvedPackage::Native(Box::new(NativeCandidate {
                     repository: repository.clone(),
-                    verified,
+                    verified: verified.clone(),
                     record_index,
                 })));
             }
@@ -773,27 +1120,105 @@ impl PackageService {
                 .packages
                 .iter()
                 .filter(|package| {
-                    package.name == selector.name
-                        && architecture_matches(
-                            &package.architectures,
-                            service_architecture(&self.config),
+                    architecture_matches(&package.architectures, service_architecture(&self.config))
+                        && constraint.map_or_else(
+                            || {
+                                package.name == selector.name
+                                    && selector
+                                        .version
+                                        .as_deref()
+                                        .is_none_or(|version| package.version == version)
+                            },
+                            |constraint| {
+                                package_satisfies_constraint(
+                                    &package.name,
+                                    &package.version,
+                                    &package.provides,
+                                    constraint,
+                                )
+                            },
                         )
-                        && selector
-                            .version
-                            .as_deref()
-                            .is_none_or(|version| package.version == version)
                 })
-                .max_by_key(|package| package.sequence)
-                .cloned();
-            if let Some(package) = selected {
+                .cloned()
+                .collect::<Vec<_>>();
+            let catalog_sha256 = hex_digest(&Sha256::digest(&catalog_bytes));
+            for package in selected {
                 candidates.push(ResolvedPackage::Source(Box::new(SourceCandidate {
                     repository: repository.clone(),
-                    catalog_sha256: hex_digest(&Sha256::digest(&catalog_bytes)),
+                    catalog_sha256: catalog_sha256.clone(),
                     package,
                 })));
             }
         }
-        choose_candidate(candidates, selector, installed)
+        Ok(candidates)
+    }
+
+    fn resolve_dependency_plan(
+        &self,
+        root: ResolvedPackage,
+        updating: bool,
+    ) -> Result<ResolvedDependencyPlan, ServiceError> {
+        let installed = self.read_all_service_receipts()?;
+        let root_package = root.package().to_string();
+        let mut universe = Vec::new();
+        let mut candidate_indexes = BTreeMap::new();
+        let root_index = insert_graph_candidate(&mut universe, &mut candidate_indexes, root)?;
+        let mut fixed = Vec::new();
+
+        for receipt in installed.values() {
+            if updating && receipt.package == root_package {
+                continue;
+            }
+            let candidate = self.resolve_installed_candidate(receipt)?;
+            fixed.push(insert_graph_candidate(
+                &mut universe,
+                &mut candidate_indexes,
+                candidate,
+            )?);
+        }
+
+        let mut cursor = 0usize;
+        while cursor < universe.len() {
+            let metadata = universe[cursor].dependency_metadata();
+            for requirement in metadata.requirements {
+                if fixed.iter().any(|candidate| {
+                    requirement.alternatives.iter().any(|constraint| {
+                        candidate_satisfies(&universe[*candidate].solver_candidate(), constraint)
+                    })
+                }) {
+                    continue;
+                }
+                for alternative in requirement.alternatives {
+                    let domain = match self.resolve_constraint_domain(&alternative) {
+                        Ok(domain) => domain,
+                        Err(ServiceError::PackageNotFound(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    for candidate in domain {
+                        if candidate_satisfies(&candidate.solver_candidate(), &alternative) {
+                            insert_graph_candidate(
+                                &mut universe,
+                                &mut candidate_indexes,
+                                candidate,
+                            )?;
+                        }
+                    }
+                }
+            }
+            cursor += 1;
+        }
+
+        let solver_candidates = universe
+            .iter()
+            .map(ResolvedPackage::solver_candidate)
+            .collect::<Vec<_>>();
+        let plan = solve_dependency_graph(&solver_candidates, root_index, &fixed)?;
+        let order = plan
+            .order
+            .into_iter()
+            .map(|candidate| universe[candidate].clone())
+            .collect();
+        Ok(ResolvedDependencyPlan { order, installed })
     }
 
     fn fetch_resource(
@@ -837,6 +1262,9 @@ impl PackageService {
             service_config_sha256: self.config_sha256.clone(),
             provider_generation: candidate.repository.generation,
             package_sequence: package.sequence,
+            requirements: package.requirements.clone(),
+            provides: package.provides.clone(),
+            conflicts: package.conflicts.clone(),
             artifact_sha256: package.artifact_sha256.clone(),
             origin: ServiceOrigin::Native {
                 index_sha256: candidate.verified.index_sha256.clone(),
@@ -847,13 +1275,21 @@ impl PackageService {
         validate_service_receipt(&receipt)?;
         let mut provisioner = BinaryProvisioner::new(self.config.artifacts.join("binary"))?;
         provisioner.allow_network = self.network;
-        Ok(PreparedCandidate {
-            receipt,
-            payload: PreparedPayload::Native {
-                provisioner,
-                verified: candidate.verified,
-            },
-        })
+        let (binary_receipt, payload) = provisioner.prepare_system_payload(
+            &candidate.verified,
+            &receipt.package,
+            Some(&receipt.version),
+        )?;
+        if binary_receipt.package != receipt.package
+            || binary_receipt.version != receipt.version
+            || binary_receipt.release != receipt.release
+            || binary_receipt.artifact_sha256 != receipt.artifact_sha256
+        {
+            return Err(ServiceError::Provider(
+                "prepared native payload differs from its service receipt".into(),
+            ));
+        }
+        Ok(PreparedCandidate { receipt, payload })
     }
 
     fn prepare_source_candidate(
@@ -939,16 +1375,12 @@ impl PackageService {
                 "translated recipe release differs from the signed source catalog".into(),
             ));
         }
-        if !recipe.build.depends.is_empty()
-            || recipe
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| !runtime.depends.is_empty())
-        {
+        if !recipe.build.depends.is_empty() {
             return Err(ServiceError::Provider(
-                "source package dependencies require a complete service transaction graph".into(),
+                "source build dependencies require an isolated build-root transaction".into(),
             ));
         }
+        validate_source_dependency_binding(package, recipe.runtime.as_ref())?;
         let compiler = host_compiler_target(&self.config.compiler)?;
         let compiler_sha256 = compiler_digest(&compiler)?;
         let build = provisioner.build_admitted_system_recipe(&imported.recipe.bytes, &compiler)?;
@@ -965,6 +1397,9 @@ impl PackageService {
             service_config_sha256: self.config_sha256.clone(),
             provider_generation: candidate.repository.generation,
             package_sequence: package.sequence,
+            requirements: package.requirements.clone(),
+            provides: package.provides.clone(),
+            conflicts: package.conflicts.clone(),
             artifact_sha256: build.artifact_sha256,
             origin: ServiceOrigin::Source {
                 ecosystem: package.ecosystem,
@@ -977,10 +1412,7 @@ impl PackageService {
             },
         };
         validate_service_receipt(&receipt)?;
-        Ok(PreparedCandidate {
-            receipt,
-            payload: PreparedPayload::Source(payload),
-        })
+        Ok(PreparedCandidate { receipt, payload })
     }
 
     fn service_receipt_directory(&self) -> PathBuf {
@@ -1019,6 +1451,44 @@ impl PackageService {
         }
     }
 
+    fn read_all_service_receipts(&self) -> Result<BTreeMap<String, ServiceReceipt>, ServiceError> {
+        let directory = self.service_receipt_directory();
+        ensure_private_directory(&directory)?;
+        let mut receipts = BTreeMap::new();
+        for entry in
+            fs::read_dir(&directory).map_err(|error| ServiceError::State(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| ServiceError::State(error.to_string()))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| ServiceError::State(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ServiceError::State(
+                    "service receipt directory contains a non-regular entry".into(),
+                ));
+            }
+            let filename = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ServiceError::State("service receipt name is not UTF-8".into()))?;
+            let package = filename.strip_suffix(".toml").ok_or_else(|| {
+                ServiceError::State("service receipt has an invalid filename".into())
+            })?;
+            if !valid_package_name(package) {
+                return Err(ServiceError::State(
+                    "service receipt has an invalid package name".into(),
+                ));
+            }
+            let receipt = self.read_service_receipt(package)?.ok_or_else(|| {
+                ServiceError::State("service receipt disappeared during enumeration".into())
+            })?;
+            if receipts.insert(package.into(), receipt).is_some() {
+                return Err(ServiceError::State("duplicate service receipt".into()));
+            }
+        }
+        Ok(receipts)
+    }
+
     fn write_service_receipt(&self, receipt: &ServiceReceipt) -> Result<(), ServiceError> {
         validate_service_receipt(receipt)?;
         ensure_private_directory(&self.service_receipt_directory())?;
@@ -1045,11 +1515,38 @@ impl PackageService {
         self.config.state.join("service-transaction.toml")
     }
 
+    fn graph_journal_path(&self) -> PathBuf {
+        self.config.state.join("service-graph-transaction.toml")
+    }
+
     fn write_journal(&self, journal: &ServiceJournal) -> Result<(), ServiceError> {
         validate_journal(journal)?;
+        if transaction_file_present(&self.journal_path(), "transaction journal")?
+            || transaction_file_present(&self.graph_journal_path(), "graph transaction journal")?
+        {
+            return Err(ServiceError::Transaction(
+                "a package transaction is already pending".into(),
+            ));
+        }
         let bytes = toml::to_string(journal)
             .map_err(|error| ServiceError::Transaction(error.to_string()))?;
         atomic_write(&self.journal_path(), bytes.as_bytes())?;
+        sync_directory(&self.config.state)?;
+        Ok(())
+    }
+
+    fn write_graph_journal(&self, journal: &ServiceGraphJournal) -> Result<(), ServiceError> {
+        validate_graph_journal(journal)?;
+        if transaction_file_present(&self.journal_path(), "transaction journal")?
+            || transaction_file_present(&self.graph_journal_path(), "graph transaction journal")?
+        {
+            return Err(ServiceError::Transaction(
+                "a package transaction is already pending".into(),
+            ));
+        }
+        let bytes = toml::to_string(journal)
+            .map_err(|error| ServiceError::Transaction(error.to_string()))?;
+        atomic_write(&self.graph_journal_path(), bytes.as_bytes())?;
         sync_directory(&self.config.state)?;
         Ok(())
     }
@@ -1062,20 +1559,32 @@ impl PackageService {
         }
     }
 
+    fn clear_graph_journal(&self) -> Result<(), ServiceError> {
+        match fs::remove_file(self.graph_journal_path()) {
+            Ok(()) => sync_directory(&self.config.state),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ServiceError::Transaction(error.to_string())),
+        }
+    }
+
     fn recover_pending(&self) -> Result<(), ServiceError> {
         ensure_private_directory(&self.config.state)?;
         ensure_private_directory(&self.service_receipt_directory())?;
-        let path = self.journal_path();
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(ServiceError::Transaction(error.to_string())),
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(ServiceError::Transaction(
-                "transaction journal is not a regular file".into(),
-            ));
+        let single = transaction_file_present(&self.journal_path(), "transaction journal")?;
+        let graph =
+            transaction_file_present(&self.graph_journal_path(), "graph transaction journal")?;
+        match (single, graph) {
+            (true, true) => Err(ServiceError::Transaction(
+                "multiple package transaction journals are pending".into(),
+            )),
+            (true, false) => self.recover_single_pending(),
+            (false, true) => self.recover_graph_pending(),
+            (false, false) => Ok(()),
         }
+    }
+
+    fn recover_single_pending(&self) -> Result<(), ServiceError> {
+        let path = self.journal_path();
         let bytes = read_regular(&path, MAX_SERVICE_DOCUMENT_BYTES)?;
         let journal: ServiceJournal = toml::from_slice(&bytes)
             .map_err(|error| ServiceError::Transaction(error.to_string()))?;
@@ -1110,19 +1619,118 @@ impl PackageService {
             )),
         }
     }
+
+    fn recover_graph_pending(&self) -> Result<(), ServiceError> {
+        let bytes = read_regular(&self.graph_journal_path(), MAX_SERVICE_DOCUMENT_BYTES)?;
+        let journal: ServiceGraphJournal = toml::from_slice(&bytes)
+            .map_err(|error| ServiceError::Transaction(error.to_string()))?;
+        validate_graph_journal(&journal)?;
+        let binary_store =
+            BinaryInstallStore::open(self.config.state.clone(), self.config.root.clone())?;
+        let ownership = journal
+            .entries
+            .iter()
+            .map(|entry| binary_store.installed_receipt(&entry.package))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if journal
+            .entries
+            .iter()
+            .zip(&ownership)
+            .all(|(entry, binary)| {
+                binary
+                    .as_ref()
+                    .is_some_and(|binary| binary_matches_service(binary, &entry.new))
+            })
+        {
+            for entry in &journal.entries {
+                self.write_service_receipt(&entry.new)?;
+            }
+            return self.clear_graph_journal();
+        }
+
+        for (index, (entry, binary)) in journal.entries.iter().zip(&ownership).enumerate() {
+            let root = index + 1 == journal.entries.len();
+            match journal.action {
+                JournalAction::Install => {
+                    if binary
+                        .as_ref()
+                        .is_some_and(|receipt| !binary_matches_service(receipt, &entry.new))
+                    {
+                        return Err(ServiceError::Transaction(format!(
+                            "interrupted graph install has foreign ownership: {}",
+                            entry.package
+                        )));
+                    }
+                }
+                JournalAction::Update if root => {
+                    let old = entry.old.as_ref().ok_or_else(|| {
+                        ServiceError::Transaction(
+                            "graph update root is missing its old receipt".into(),
+                        )
+                    })?;
+                    if !binary
+                        .as_ref()
+                        .is_some_and(|receipt| binary_matches_service(receipt, old))
+                    {
+                        return Err(ServiceError::Transaction(
+                            "interrupted graph update committed its root without a complete dependency graph"
+                                .into(),
+                        ));
+                    }
+                }
+                JournalAction::Update => {
+                    if binary
+                        .as_ref()
+                        .is_some_and(|receipt| !binary_matches_service(receipt, &entry.new))
+                    {
+                        return Err(ServiceError::Transaction(format!(
+                            "interrupted graph update has foreign dependency ownership: {}",
+                            entry.package
+                        )));
+                    }
+                }
+                JournalAction::Remove => {
+                    return Err(ServiceError::Transaction(
+                        "graph removal journals are unsupported".into(),
+                    ));
+                }
+            }
+        }
+
+        for (entry, binary) in journal.entries.iter().zip(&ownership).rev() {
+            if entry.old.is_none()
+                && binary
+                    .as_ref()
+                    .is_some_and(|receipt| binary_matches_service(receipt, &entry.new))
+            {
+                match binary_store.remove(&entry.package) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        if binary_store.installed_receipt(&entry.package)?.is_some() {
+                            return Err(ServiceError::Transaction(format!(
+                                "failed to roll back graph package {}: {error}",
+                                entry.package
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        for entry in &journal.entries {
+            if let Some(old) = &entry.old {
+                self.write_service_receipt(old)?;
+            } else {
+                self.remove_service_receipt(&entry.package)?;
+            }
+        }
+        self.clear_graph_journal()
+    }
 }
 
 struct PreparedCandidate {
     receipt: ServiceReceipt,
-    payload: PreparedPayload,
-}
-
-enum PreparedPayload {
-    Native {
-        provisioner: BinaryProvisioner,
-        verified: VerifiedBinaryIndex,
-    },
-    Source(crate::binary::BinaryPayload),
+    payload: crate::binary::BinaryPayload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1143,6 +1751,31 @@ struct ServiceJournal {
     old: Option<ServiceReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     new: Option<ServiceReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceGraphJournal {
+    format: u32,
+    action: JournalAction,
+    root: String,
+    #[serde(rename = "entry")]
+    entries: Vec<ServiceGraphJournalEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceGraphJournalEntry {
+    package: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old: Option<ServiceReceipt>,
+    new: ServiceReceipt,
+}
+
+struct PreparedGraphEntry {
+    old: Option<ServiceReceipt>,
+    prepared: PreparedCandidate,
+    mutate_binary: bool,
 }
 
 struct ServiceLock {
@@ -1358,8 +1991,10 @@ fn validate_source_catalog(
     key_id: &str,
     now_unix: u64,
 ) -> Result<(), ServiceError> {
-    if catalog.format != SOURCE_CATALOG_FORMAT
-        || catalog.key_id != key_id
+    if !matches!(
+        catalog.format,
+        LEGACY_SOURCE_CATALOG_FORMAT | SOURCE_CATALOG_FORMAT
+    ) || catalog.key_id != key_id
         || catalog.name != repository.name
         || catalog.channel != repository.channel
         || catalog.generation != repository.generation
@@ -1390,6 +2025,23 @@ fn validate_source_catalog(
         {
             return Err(ServiceError::Provider(format!(
                 "invalid or duplicate source package: {}",
+                package.name
+            )));
+        }
+        if (catalog.format == LEGACY_SOURCE_CATALOG_FORMAT
+            && (!package.requirements.is_empty()
+                || !package.provides.is_empty()
+                || !package.conflicts.is_empty()))
+            || (catalog.format == SOURCE_CATALOG_FORMAT
+                && validate_dependency_metadata(
+                    &package.requirements,
+                    &package.provides,
+                    &package.conflicts,
+                )
+                .is_err())
+        {
+            return Err(ServiceError::Provider(format!(
+                "invalid source dependency metadata: {}",
                 package.name
             )));
         }
@@ -1441,56 +2093,62 @@ fn validate_service_target(
     Ok(())
 }
 
-fn choose_candidate(
-    mut candidates: Vec<ResolvedPackage>,
-    selector: &PackageSelector,
-    installed: Option<&ServiceReceipt>,
-) -> Result<ResolvedPackage, ServiceError> {
-    if let Some(receipt) = installed {
-        candidates.retain(|candidate| {
-            candidate.provider() == receipt.provider
-                && candidate.channel() == receipt.channel
-                && candidate.route() == receipt.origin.route_name()
-        });
-    } else if let Some(namespace) = selector.namespace.as_deref() {
-        candidates.retain(|candidate| candidate.namespace_matches(namespace));
-    } else if candidates
-        .iter()
-        .any(|candidate| matches!(candidate, ResolvedPackage::Native(_)))
-    {
-        candidates.retain(|candidate| matches!(candidate, ResolvedPackage::Native(_)));
+fn validate_source_dependency_binding(
+    package: &SourceCatalogPackage,
+    runtime: Option<&crate::hardware::RecipeRuntime>,
+) -> Result<(), ServiceError> {
+    let empty = crate::hardware::RecipeRuntime::default();
+    let runtime = runtime.unwrap_or(&empty);
+    for dependency in &runtime.depends {
+        if !package.requirements.iter().any(|requirement| {
+            requirement
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.name == *dependency)
+        }) {
+            return Err(ServiceError::Provider(format!(
+                "source catalog omits recipe dependency: {dependency}"
+            )));
+        }
     }
-    if candidates.is_empty() {
-        return Err(ServiceError::PackageNotFound(selector.name.clone()));
+    if package.requirements.iter().any(|requirement| {
+        !requirement.alternatives.iter().any(|alternative| {
+            runtime
+                .depends
+                .iter()
+                .any(|dependency| dependency == &alternative.name)
+        })
+    }) {
+        return Err(ServiceError::Provider(
+            "source catalog dependency has no recipe counterpart".into(),
+        ));
     }
-    let highest = candidates
+    let catalog_provides = package
+        .provides
         .iter()
-        .map(ResolvedPackage::priority)
-        .max()
-        .ok_or_else(|| ServiceError::PackageNotFound(selector.name.clone()))?;
-    candidates.retain(|candidate| candidate.priority() == highest);
-    let identities = candidates
-        .iter()
-        .map(ResolvedPackage::identity)
+        .map(|capability| capability.name.as_str())
         .collect::<BTreeSet<_>>();
-    if identities.len() != 1 {
-        let mut providers = candidates
-            .iter()
-            .map(|candidate| {
-                format!(
-                    "{}:{}-{}",
-                    candidate.provider(),
-                    candidate.package(),
-                    candidate.version()
-                )
-            })
-            .collect::<Vec<_>>();
-        providers.sort();
-        providers.dedup();
-        return Err(ServiceError::Ambiguous(providers));
+    let recipe_provides = runtime
+        .provides
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let catalog_conflicts = package
+        .conflicts
+        .iter()
+        .map(|constraint| constraint.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let recipe_conflicts = runtime
+        .conflicts
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if catalog_provides != recipe_provides || catalog_conflicts != recipe_conflicts {
+        return Err(ServiceError::Provider(
+            "source catalog capabilities or conflicts differ from the recipe".into(),
+        ));
     }
-    candidates.sort_by(|left, right| left.provider().cmp(right.provider()));
-    Ok(candidates.remove(0))
+    Ok(())
 }
 
 fn enforce_update_floor(
@@ -1523,6 +2181,13 @@ fn enforce_update_floor(
             "service metadata changed without advancing its generation".into(),
         ));
     }
+    if candidate.package_sequence() == old.package_sequence
+        && !candidate_record_matches_receipt(candidate, old)
+    {
+        return Err(ServiceError::Downgrade(
+            "package identity changed without advancing its sequence".into(),
+        ));
+    }
     let old_authority_sha256 = match &old.origin {
         ServiceOrigin::Native { index_sha256, .. } => index_sha256,
         ServiceOrigin::Source { catalog_sha256, .. } => catalog_sha256,
@@ -1537,20 +2202,85 @@ fn enforce_update_floor(
     Ok(())
 }
 
+fn candidate_record_matches_receipt(candidate: &ResolvedPackage, receipt: &ServiceReceipt) -> bool {
+    if candidate.package() != receipt.package
+        || candidate.version() != receipt.version
+        || candidate.release() != receipt.release
+        || candidate.package_sequence() != receipt.package_sequence
+        || candidate.dependency_metadata() != receipt.dependency_metadata()
+    {
+        return false;
+    }
+    match (candidate, &receipt.origin) {
+        (
+            ResolvedPackage::Native(candidate),
+            ServiceOrigin::Native {
+                metadata_sha256,
+                source_lock_sha256,
+                ..
+            },
+        ) => {
+            let package = candidate.record();
+            package.artifact_sha256 == receipt.artifact_sha256
+                && package.metadata_sha256 == metadata_sha256.as_str()
+                && package.source_lock_sha256 == source_lock_sha256.as_str()
+        }
+        (
+            ResolvedPackage::Source(candidate),
+            ServiceOrigin::Source {
+                ecosystem,
+                ingress_lock_sha256,
+                target_policy_sha256,
+                recipe_sha256,
+                source_lock_sha256,
+                ..
+            },
+        ) => {
+            candidate.package.ecosystem == *ecosystem
+                && candidate.package.ingress_lock_sha256 == ingress_lock_sha256.as_str()
+                && candidate.package.target_policy_sha256 == target_policy_sha256.as_str()
+                && candidate.package.recipe_sha256 == recipe_sha256.as_str()
+                && candidate.package.source_lock_sha256 == source_lock_sha256.as_str()
+        }
+        _ => false,
+    }
+}
+
+fn insert_graph_candidate(
+    universe: &mut Vec<ResolvedPackage>,
+    indexes: &mut BTreeMap<String, usize>,
+    candidate: ResolvedPackage,
+) -> Result<usize, ServiceError> {
+    let key = candidate.graph_key();
+    if let Some(index) = indexes.get(&key) {
+        return Ok(*index);
+    }
+    if universe.len() >= crate::alchemist::MAX_PACKAGES {
+        return Err(ServiceError::Dependency(format!(
+            "candidate closure exceeds {} records",
+            crate::alchemist::MAX_PACKAGES
+        )));
+    }
+    let index = universe.len();
+    universe.push(candidate);
+    indexes.insert(key, index);
+    Ok(index)
+}
+
 fn parse_selector(value: &str) -> Result<PackageSelector, ServiceError> {
     if value.is_empty() || value.len() > MAX_VERSION_BYTES + MAX_NAME_BYTES + 2 {
         return Err(ServiceError::Configuration(
             "invalid package selector".into(),
         ));
     }
-    let (namespace, package) = value
+    let (qualified, version) = value
+        .rsplit_once('@')
+        .map_or((value, None), |(name, version)| (name, Some(version)));
+    let (namespace, name) = qualified
         .split_once(':')
-        .map_or((None, value), |(namespace, package)| {
+        .map_or((None, qualified), |(namespace, package)| {
             (Some(namespace), package)
         });
-    let (name, version) = package
-        .rsplit_once('@')
-        .map_or((package, None), |(name, version)| (name, Some(version)));
     if !valid_package_name(name)
         || namespace.is_some_and(|namespace| !valid_name(namespace))
         || version.is_some_and(|version| !valid_version(version))
@@ -1591,8 +2321,10 @@ fn selector_matches_receipt(
 }
 
 fn validate_service_receipt(receipt: &ServiceReceipt) -> Result<(), ServiceError> {
-    if receipt.format != SERVICE_RECEIPT_FORMAT
-        || !valid_package_name(&receipt.package)
+    if !matches!(
+        receipt.format,
+        LEGACY_SERVICE_RECEIPT_FORMAT | SERVICE_RECEIPT_FORMAT
+    ) || !valid_package_name(&receipt.package)
         || !valid_version(&receipt.version)
         || receipt.release == 0
         || !valid_name(&receipt.provider)
@@ -1603,6 +2335,22 @@ fn validate_service_receipt(receipt: &ServiceReceipt) -> Result<(), ServiceError
         || !valid_digest(&receipt.artifact_sha256)
     {
         return Err(ServiceError::State("invalid service receipt".into()));
+    }
+    if (receipt.format == LEGACY_SERVICE_RECEIPT_FORMAT
+        && (!receipt.requirements.is_empty()
+            || !receipt.provides.is_empty()
+            || !receipt.conflicts.is_empty()))
+        || (receipt.format == SERVICE_RECEIPT_FORMAT
+            && validate_dependency_metadata(
+                &receipt.requirements,
+                &receipt.provides,
+                &receipt.conflicts,
+            )
+            .is_err())
+    {
+        return Err(ServiceError::State(
+            "invalid service receipt dependency metadata".into(),
+        ));
     }
     match &receipt.origin {
         ServiceOrigin::Native {
@@ -1676,6 +2424,73 @@ fn validate_journal(journal: &ServiceJournal) -> Result<(), ServiceError> {
         ));
     }
     Ok(())
+}
+
+fn validate_graph_journal(journal: &ServiceGraphJournal) -> Result<(), ServiceError> {
+    if journal.format != SERVICE_GRAPH_JOURNAL_FORMAT
+        || !valid_package_name(&journal.root)
+        || journal.entries.is_empty()
+        || journal.entries.len() > crate::alchemist::MAX_PACKAGES
+        || matches!(journal.action, JournalAction::Remove)
+    {
+        return Err(ServiceError::Transaction(
+            "invalid graph journal header".into(),
+        ));
+    }
+    let mut packages = BTreeSet::new();
+    for (index, entry) in journal.entries.iter().enumerate() {
+        if !valid_package_name(&entry.package) || !packages.insert(entry.package.clone()) {
+            return Err(ServiceError::Transaction(
+                "graph journal package identities are invalid or duplicated".into(),
+            ));
+        }
+        validate_service_receipt(&entry.new)?;
+        if entry.new.package != entry.package {
+            return Err(ServiceError::Transaction(
+                "graph journal new package differs".into(),
+            ));
+        }
+        if let Some(old) = &entry.old {
+            validate_service_receipt(old)?;
+            if old.package != entry.package {
+                return Err(ServiceError::Transaction(
+                    "graph journal old package differs".into(),
+                ));
+            }
+        }
+        let root = index + 1 == journal.entries.len();
+        let valid_shape = match journal.action {
+            JournalAction::Install => entry.old.is_none(),
+            JournalAction::Update => root == entry.old.is_some(),
+            JournalAction::Remove => false,
+        };
+        if !valid_shape {
+            return Err(ServiceError::Transaction(
+                "invalid graph journal transition".into(),
+            ));
+        }
+    }
+    if journal
+        .entries
+        .last()
+        .is_none_or(|entry| entry.package != journal.root)
+    {
+        return Err(ServiceError::Transaction(
+            "graph journal root is not the final entry".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn transaction_file_present(path: &Path, label: &str) -> Result<bool, ServiceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            ServiceError::Transaction(format!("{label} is not a regular file")),
+        ),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ServiceError::Transaction(error.to_string())),
+    }
 }
 
 fn binary_matches_service(binary: &BinaryInstallReceipt, service: &ServiceReceipt) -> bool {
@@ -1957,7 +2772,7 @@ fn valid_version(value: &str) -> bool {
         && value.bytes().all(|byte| {
             !byte.is_ascii_control()
                 && !byte.is_ascii_whitespace()
-                && !matches!(byte, b'/' | b'\\' | b':' | b'@')
+                && !matches!(byte, b'/' | b'\\' | b'@')
         })
 }
 
@@ -2095,11 +2910,57 @@ mod tests {
         )
     }
 
+    struct NativePackageFixture {
+        name: String,
+        version: String,
+        sequence: u64,
+        contents: Vec<u8>,
+        requirements: Vec<PackageRequirement>,
+        provides: Vec<PackageCapability>,
+        conflicts: Vec<PackageConstraint>,
+    }
+
+    fn native_package(
+        name: &str,
+        version: &str,
+        sequence: u64,
+        contents: &[u8],
+    ) -> NativePackageFixture {
+        NativePackageFixture {
+            name: name.into(),
+            version: version.into(),
+            sequence,
+            contents: contents.into(),
+            requirements: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+        }
+    }
+
     fn native_repository_versions(
         roots: &TestRoots,
         signing: &SigningKey,
         generation: u64,
         records: Vec<(&str, u64, &[u8])>,
+    ) -> NativeRepository {
+        native_repository_packages(
+            roots,
+            signing,
+            generation,
+            records
+                .into_iter()
+                .map(|(version, sequence, contents)| {
+                    native_package("demo", version, sequence, contents)
+                })
+                .collect(),
+        )
+    }
+
+    fn native_repository_packages(
+        roots: &TestRoots,
+        signing: &SigningKey,
+        generation: u64,
+        records: Vec<NativePackageFixture>,
     ) -> NativeRepository {
         let metadata_sha256 = "a".repeat(64);
         let source_lock_sha256 = "b".repeat(64);
@@ -2112,32 +2973,49 @@ mod tests {
                 .unwrap();
         }
         let mut packages = Vec::with_capacity(records.len());
-        for (version, sequence, contents) in records {
+        for record in records {
+            let NativePackageFixture {
+                name,
+                version,
+                sequence,
+                contents,
+                requirements,
+                provides,
+                conflicts,
+            } = record;
+            let url = format!("https://packages.example/{name}-{version}.pkg");
             let mut package = BinaryPackage {
-                name: "demo".into(),
-                version: version.into(),
+                name,
+                version,
                 release: 1,
                 sequence,
+                requirements,
+                provides,
+                conflicts,
                 scope: PackageScope::System,
                 repository: RepositoryAuthority::ArachNative,
                 metadata_sha256: metadata_sha256.clone(),
                 artifact_sha256: "c".repeat(64),
                 source_lock_sha256: source_lock_sha256.clone(),
-                url: format!("https://packages.example/demo-{version}.pkg"),
+                url,
                 size: 1,
             };
             let payload = encode_binary_payload(
                 &package,
                 &[BinaryPayloadFile {
-                    path: "usr/bin/demo".into(),
+                    path: format!("usr/bin/{}", package.name),
                     mode: 0o755,
-                    bytes: contents.to_vec(),
+                    bytes: contents,
                 }],
             )
             .unwrap();
             package.artifact_sha256 = hex_digest(&Sha256::digest(&payload));
             package.size = payload.len() as u64;
-            fs::write(binary_cache.join(format!("demo-{version}-1.pkg")), payload).unwrap();
+            fs::write(
+                binary_cache.join(format!("{}-{}-1.pkg", package.name, package.version)),
+                payload,
+            )
+            .unwrap();
             packages.push(package);
         }
         let index = BinaryRepositoryIndex {
@@ -2173,6 +3051,9 @@ mod tests {
             version: "9.0.0".into(),
             release: 1,
             sequence: 9,
+            requirements: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
             ecosystem: UniversalEcosystem::Aur,
             architectures: vec!["x86-64".into()],
             ingress_lock: root
@@ -2267,12 +3148,21 @@ mod tests {
     }
 
     fn buildable_source_repository(roots: &TestRoots, signing: &SigningKey) -> SourceRepository {
+        buildable_source_repository_with_dependency(roots, signing, None)
+    }
+
+    fn buildable_source_repository_with_dependency(
+        roots: &TestRoots,
+        signing: &SigningKey,
+        dependency: Option<&str>,
+    ) -> SourceRepository {
         let provider_repository = "https://aur.archlinux.org/demo.git";
         let provider_revision = "2".repeat(40);
         let source_repository = "https://example.org/demo.git";
         let source_revision = "1".repeat(40);
+        let depends = dependency.map_or_else(|| "()".into(), |name| format!("('{name}')"));
         let pkgbuild = format!(
-            "pkgname=demo\npkgver=1.0.0\npkgrel=1\npkgdesc='demo service test'\narch=('x86_64')\nlicense=('MIT')\nsource=('git+{source_repository}#commit={source_revision}')\nsha256sums=('SKIP')\ndepends=()\nmakedepends=()\nprovides=()\nconflicts=()\n"
+            "pkgname=demo\npkgver=1.0.0\npkgrel=1\npkgdesc='demo service test'\narch=('x86_64')\nlicense=('MIT')\nsource=('git+{source_repository}#commit={source_revision}')\nsha256sums=('SKIP')\ndepends={depends}\nmakedepends=()\nprovides=()\nconflicts=()\n"
         );
         let upstream = roots.root.join("upstream-metadata");
         fs::create_dir(&upstream).unwrap();
@@ -2302,6 +3192,12 @@ mod tests {
             version: "1.0.0".into(),
             release: 1,
             sequence: 1,
+            requirements: dependency
+                .map(crate::dependency::package_requirement)
+                .into_iter()
+                .collect(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
             ecosystem: UniversalEcosystem::Aur,
             architectures: vec!["x86-64".into()],
             ingress_lock: signed_lock.path.to_string_lossy().into_owned(),
@@ -2400,6 +3296,16 @@ mod tests {
 
     fn open_service(roots: &TestRoots, config: &Path, signature: &Path) -> PackageService {
         PackageService::open_at(config, signature, &roots.keyring, true, 1).unwrap()
+    }
+
+    #[test]
+    fn selectors_preserve_provider_names_and_foreign_version_epochs() {
+        let selector = parse_selector("stable-native:demo@2:1.4.0~rc1-3.fc44").unwrap();
+        assert_eq!(selector.namespace.as_deref(), Some("stable-native"));
+        assert_eq!(selector.name, "demo");
+        assert_eq!(selector.version.as_deref(), Some("2:1.4.0~rc1-3.fc44"));
+        assert!(parse_selector("demo@bad version").is_err());
+        assert!(parse_selector("demo@bad/path").is_err());
     }
 
     #[test]
@@ -2506,6 +3412,464 @@ mod tests {
     }
 
     #[test]
+    fn standard_install_resolves_and_commits_a_native_dependency_graph() {
+        let signing = SigningKey::from_bytes(&[40_u8; 32]);
+        let roots = temporary_roots("native-graph", &signing);
+        let mut app = native_package("app", "1.0.0", 1, b"application\n");
+        app.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime = native_package("runtime-lib", "2.0.0", 2, b"runtime\n");
+        let repository = native_repository_packages(&roots, &signing, 1, vec![app, runtime]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+
+        let installed = service.install("app").unwrap();
+        assert_eq!(installed.package, "app");
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/app")).unwrap(),
+            b"application\n"
+        );
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/runtime-lib")).unwrap(),
+            b"runtime\n"
+        );
+        assert!(service.read_service_receipt("app").unwrap().is_some());
+        assert!(
+            service
+                .read_service_receipt("runtime-lib")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!service.graph_journal_path().exists());
+
+        assert!(matches!(
+            service.remove("runtime-lib"),
+            Err(ServiceError::Dependency(_))
+        ));
+        assert!(roots.target.join("usr/bin/runtime-lib").exists());
+        service.remove("app").unwrap();
+        assert!(!roots.target.join("usr/bin/app").exists());
+        assert!(roots.target.join("usr/bin/runtime-lib").exists());
+        service.remove("runtime-lib").unwrap();
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn standard_update_adds_missing_dependencies_before_replacing_the_root() {
+        let signing = SigningKey::from_bytes(&[48_u8; 32]);
+        let roots = temporary_roots("native-graph-update", &signing);
+        let repository_v1 = native_repository_packages(
+            &roots,
+            &signing,
+            1,
+            vec![native_package("app", "1.0.0", 1, b"version-one\n")],
+        );
+        let (config_v1, signature_v1) =
+            write_config(&roots, &signing, 1, vec![repository_v1], vec![]);
+        let service_v1 = open_service(&roots, &config_v1, &signature_v1);
+        service_v1.install("app").unwrap();
+
+        let mut app_v2 = native_package("app", "2.0.0", 2, b"version-two\n");
+        app_v2.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let repository_v2 = native_repository_packages(&roots, &signing, 2, vec![app_v2, runtime]);
+        let (config_v2, signature_v2) =
+            write_config(&roots, &signing, 2, vec![repository_v2], vec![]);
+        let service_v2 = open_service(&roots, &config_v2, &signature_v2);
+
+        let updated = service_v2.update("app").unwrap();
+        assert_eq!(updated.version, "2.0.0");
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/runtime-lib")).unwrap(),
+            b"runtime\n"
+        );
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/app")).unwrap(),
+            b"version-two\n"
+        );
+        assert!(!service_v2.graph_journal_path().exists());
+        service_v2.remove("app").unwrap();
+        service_v2.remove("runtime-lib").unwrap();
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn update_rejects_dependency_metadata_rewrite_without_a_new_package_sequence() {
+        let signing = SigningKey::from_bytes(&[53_u8; 32]);
+        let roots = temporary_roots("native-dependency-rewrite", &signing);
+        let mut app_v1 = native_package("app", "1.0.0", 1, b"application\n");
+        app_v1.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime_v1 = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let repository_v1 =
+            native_repository_packages(&roots, &signing, 1, vec![app_v1, runtime_v1]);
+        let (config_v1, signature_v1) =
+            write_config(&roots, &signing, 1, vec![repository_v1], vec![]);
+        let service_v1 = open_service(&roots, &config_v1, &signature_v1);
+        service_v1.install("app").unwrap();
+
+        let mut rewritten = native_package("app", "1.0.0", 1, b"application\n");
+        rewritten.requirements = vec![crate::dependency::package_requirement("other-runtime")];
+        let runtime_v2 = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let other = native_package("other-runtime", "1.0.0", 1, b"other\n");
+        let repository_v2 =
+            native_repository_packages(&roots, &signing, 2, vec![rewritten, runtime_v2, other]);
+        let (config_v2, signature_v2) =
+            write_config(&roots, &signing, 2, vec![repository_v2], vec![]);
+        let service_v2 = open_service(&roots, &config_v2, &signature_v2);
+
+        assert!(matches!(
+            service_v2.update("app"),
+            Err(ServiceError::Downgrade(_))
+        ));
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/app")).unwrap(),
+            b"application\n"
+        );
+        assert!(roots.target.join("usr/bin/runtime-lib").exists());
+        assert!(!roots.target.join("usr/bin/other-runtime").exists());
+        assert!(!service_v2.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn dependency_graph_discovers_an_exact_virtual_capability_provider() {
+        let signing = SigningKey::from_bytes(&[41_u8; 32]);
+        let roots = temporary_roots("native-capability", &signing);
+        let mut app = native_package("app", "1.0.0", 1, b"application\n");
+        app.requirements = vec![PackageRequirement {
+            alternatives: vec![PackageConstraint {
+                name: "ssl-api".into(),
+                versions: vec!["3".into()],
+            }],
+        }];
+        let mut openssl = native_package("openssl", "3.4.0", 3, b"openssl\n");
+        openssl.provides = vec![PackageCapability {
+            name: "ssl-api".into(),
+            version: Some("3".into()),
+        }];
+        let mut incompatible = native_package("other-tls", "4.0.0", 4, b"other\n");
+        incompatible.provides = vec![PackageCapability {
+            name: "ssl-api".into(),
+            version: Some("4".into()),
+        }];
+        let repository =
+            native_repository_packages(&roots, &signing, 1, vec![app, openssl, incompatible]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+
+        service.install("app").unwrap();
+        assert!(roots.target.join("usr/bin/openssl").exists());
+        assert!(!roots.target.join("usr/bin/other-tls").exists());
+        assert!(service.read_service_receipt("openssl").unwrap().is_some());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn dependency_graph_honors_exact_foreign_versions_instead_of_latest_sequence() {
+        let signing = SigningKey::from_bytes(&[52_u8; 32]);
+        let roots = temporary_roots("native-exact-dependency", &signing);
+        let required_version = "1:1.0~rc1-1";
+        let mut app = native_package("app", "1.0.0", 1, b"application\n");
+        app.requirements = vec![PackageRequirement {
+            alternatives: vec![PackageConstraint {
+                name: "runtime-lib".into(),
+                versions: vec![required_version.into()],
+            }],
+        }];
+        let required = native_package("runtime-lib", required_version, 1, b"required\n");
+        let latest = native_package("runtime-lib", "2.0.0", 2, b"latest\n");
+        let repository =
+            native_repository_packages(&roots, &signing, 1, vec![app, required, latest]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+
+        service.install("app").unwrap();
+        assert_eq!(
+            service
+                .read_service_receipt("runtime-lib")
+                .unwrap()
+                .unwrap()
+                .version,
+            required_version
+        );
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/runtime-lib")).unwrap(),
+            b"required\n"
+        );
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn installed_package_conflicts_block_a_later_standard_install() {
+        let signing = SigningKey::from_bytes(&[42_u8; 32]);
+        let roots = temporary_roots("native-conflict", &signing);
+        let mut legacy = native_package("legacy", "1.0.0", 1, b"legacy\n");
+        legacy.conflicts = vec![PackageConstraint {
+            name: "app".into(),
+            versions: Vec::new(),
+        }];
+        let app = native_package("app", "1.0.0", 1, b"application\n");
+        let repository = native_repository_packages(&roots, &signing, 1, vec![legacy, app]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+
+        service.install("legacy").unwrap();
+        assert!(matches!(
+            service.install("app"),
+            Err(ServiceError::Dependency(_))
+        ));
+        assert!(!roots.target.join("usr/bin/app").exists());
+        assert!(service.read_service_receipt("app").unwrap().is_none());
+        assert!(!service.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn dependency_cycles_fail_before_any_target_mutation() {
+        let signing = SigningKey::from_bytes(&[43_u8; 32]);
+        let roots = temporary_roots("native-cycle", &signing);
+        let mut alpha = native_package("alpha", "1.0.0", 1, b"alpha\n");
+        alpha.requirements = vec![crate::dependency::package_requirement("beta")];
+        let mut beta = native_package("beta", "1.0.0", 1, b"beta\n");
+        beta.requirements = vec![crate::dependency::package_requirement("alpha")];
+        let repository = native_repository_packages(&roots, &signing, 1, vec![alpha, beta]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+
+        assert!(matches!(
+            service.install("alpha"),
+            Err(ServiceError::Dependency(_))
+        ));
+        assert!(!roots.target.join("usr/bin/alpha").exists());
+        assert!(!roots.target.join("usr/bin/beta").exists());
+        assert!(service.read_all_service_receipts().unwrap().is_empty());
+        assert!(!service.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn failed_graph_root_install_rolls_back_new_dependencies() {
+        let signing = SigningKey::from_bytes(&[44_u8; 32]);
+        let roots = temporary_roots("native-graph-rollback", &signing);
+        let mut app = native_package("app", "1.0.0", 1, b"managed-app\n");
+        app.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let repository = native_repository_packages(&roots, &signing, 1, vec![app, runtime]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+        fs::create_dir_all(roots.target.join("usr/bin")).unwrap();
+        fs::write(roots.target.join("usr/bin/app"), b"unmanaged\n").unwrap();
+
+        assert!(service.install("app").is_err());
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/app")).unwrap(),
+            b"unmanaged\n"
+        );
+        assert!(!roots.target.join("usr/bin/runtime-lib").exists());
+        assert!(service.read_all_service_receipts().unwrap().is_empty());
+        assert!(!service.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_partial_graph_install_rolls_back_owned_dependencies() {
+        let signing = SigningKey::from_bytes(&[45_u8; 32]);
+        let roots = temporary_roots("native-graph-recovery-rollback", &signing);
+        let mut app = native_package("app", "1.0.0", 1, b"application\n");
+        app.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let repository = native_repository_packages(&roots, &signing, 1, vec![app, runtime]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+        let selector = parse_selector("app").unwrap();
+        let root = service.resolve(&selector, None).unwrap();
+        let plan = service.resolve_dependency_plan(root, false).unwrap();
+        let prepared = plan
+            .order
+            .into_iter()
+            .map(|candidate| service.prepare_candidate(candidate).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|entry| entry.receipt.package.as_str())
+                .collect::<Vec<_>>(),
+            vec!["runtime-lib", "app"]
+        );
+        service
+            .write_graph_journal(&ServiceGraphJournal {
+                format: SERVICE_GRAPH_JOURNAL_FORMAT,
+                action: JournalAction::Install,
+                root: "app".into(),
+                entries: prepared
+                    .iter()
+                    .map(|entry| ServiceGraphJournalEntry {
+                        package: entry.receipt.package.clone(),
+                        old: None,
+                        new: entry.receipt.clone(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let binary_store =
+            BinaryInstallStore::open(roots.state.clone(), roots.target.clone()).unwrap();
+        service.write_service_receipt(&prepared[0].receipt).unwrap();
+        binary_store
+            .install_payload(
+                &prepared[0].payload,
+                &prepared[0].receipt.artifact_sha256,
+                false,
+            )
+            .unwrap();
+        service.write_service_receipt(&prepared[1].receipt).unwrap();
+
+        service.recover_pending().unwrap();
+        assert!(!roots.target.join("usr/bin/runtime-lib").exists());
+        assert!(!roots.target.join("usr/bin/app").exists());
+        assert!(service.read_all_service_receipts().unwrap().is_empty());
+        assert!(!service.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_fully_owned_graph_install_rolls_receipts_forward() {
+        let signing = SigningKey::from_bytes(&[46_u8; 32]);
+        let roots = temporary_roots("native-graph-recovery-forward", &signing);
+        let mut app = native_package("app", "1.0.0", 1, b"application\n");
+        app.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let repository = native_repository_packages(&roots, &signing, 1, vec![app, runtime]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+        let selector = parse_selector("app").unwrap();
+        let root = service.resolve(&selector, None).unwrap();
+        let plan = service.resolve_dependency_plan(root, false).unwrap();
+        let prepared = plan
+            .order
+            .into_iter()
+            .map(|candidate| service.prepare_candidate(candidate).unwrap())
+            .collect::<Vec<_>>();
+        service
+            .write_graph_journal(&ServiceGraphJournal {
+                format: SERVICE_GRAPH_JOURNAL_FORMAT,
+                action: JournalAction::Install,
+                root: "app".into(),
+                entries: prepared
+                    .iter()
+                    .map(|entry| ServiceGraphJournalEntry {
+                        package: entry.receipt.package.clone(),
+                        old: None,
+                        new: entry.receipt.clone(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let binary_store =
+            BinaryInstallStore::open(roots.state.clone(), roots.target.clone()).unwrap();
+        for entry in &prepared {
+            binary_store
+                .install_payload(&entry.payload, &entry.receipt.artifact_sha256, false)
+                .unwrap();
+        }
+
+        service.recover_pending().unwrap();
+        assert!(roots.target.join("usr/bin/runtime-lib").exists());
+        assert!(roots.target.join("usr/bin/app").exists());
+        assert!(
+            service
+                .read_service_receipt("runtime-lib")
+                .unwrap()
+                .is_some()
+        );
+        assert!(service.read_service_receipt("app").unwrap().is_some());
+        assert!(!service.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_graph_update_with_an_old_root_rolls_dependencies_back() {
+        let signing = SigningKey::from_bytes(&[49_u8; 32]);
+        let roots = temporary_roots("native-graph-update-recovery", &signing);
+        let repository_v1 = native_repository_packages(
+            &roots,
+            &signing,
+            1,
+            vec![native_package("app", "1.0.0", 1, b"version-one\n")],
+        );
+        let (config_v1, signature_v1) =
+            write_config(&roots, &signing, 1, vec![repository_v1], vec![]);
+        let service_v1 = open_service(&roots, &config_v1, &signature_v1);
+        service_v1.install("app").unwrap();
+        let old = service_v1.read_service_receipt("app").unwrap().unwrap();
+
+        let mut app_v2 = native_package("app", "2.0.0", 2, b"version-two\n");
+        app_v2.requirements = vec![crate::dependency::package_requirement("runtime-lib")];
+        let runtime = native_package("runtime-lib", "1.0.0", 1, b"runtime\n");
+        let repository_v2 = native_repository_packages(&roots, &signing, 2, vec![app_v2, runtime]);
+        let (config_v2, signature_v2) =
+            write_config(&roots, &signing, 2, vec![repository_v2], vec![]);
+        let service_v2 = open_service(&roots, &config_v2, &signature_v2);
+        let selector = parse_selector("app").unwrap();
+        let root = service_v2.resolve(&selector, Some(&old)).unwrap();
+        let plan = service_v2.resolve_dependency_plan(root, true).unwrap();
+        let prepared = plan
+            .order
+            .into_iter()
+            .map(|candidate| service_v2.prepare_candidate(candidate).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(prepared.last().unwrap().receipt.package, "app");
+        service_v2
+            .write_graph_journal(&ServiceGraphJournal {
+                format: SERVICE_GRAPH_JOURNAL_FORMAT,
+                action: JournalAction::Update,
+                root: "app".into(),
+                entries: prepared
+                    .iter()
+                    .map(|entry| ServiceGraphJournalEntry {
+                        package: entry.receipt.package.clone(),
+                        old: (entry.receipt.package == "app").then(|| old.clone()),
+                        new: entry.receipt.clone(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let binary_store =
+            BinaryInstallStore::open(roots.state.clone(), roots.target.clone()).unwrap();
+        let dependency = prepared
+            .iter()
+            .find(|entry| entry.receipt.package == "runtime-lib")
+            .unwrap();
+        service_v2
+            .write_service_receipt(&dependency.receipt)
+            .unwrap();
+        binary_store
+            .install_payload(
+                &dependency.payload,
+                &dependency.receipt.artifact_sha256,
+                false,
+            )
+            .unwrap();
+        service_v2
+            .write_service_receipt(&prepared.last().unwrap().receipt)
+            .unwrap();
+
+        service_v2.recover_pending().unwrap();
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/app")).unwrap(),
+            b"version-one\n"
+        );
+        assert!(!roots.target.join("usr/bin/runtime-lib").exists());
+        assert_eq!(service_v2.read_service_receipt("app").unwrap(), Some(old));
+        assert!(
+            service_v2
+                .read_service_receipt("runtime-lib")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!service_v2.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
     fn signed_source_catalog_builds_and_installs_through_the_standard_lifecycle() {
         let signing = SigningKey::from_bytes(&[36_u8; 32]);
         let roots = temporary_roots("source-lifecycle", &signing);
@@ -2528,6 +3892,37 @@ mod tests {
     }
 
     #[test]
+    fn standard_source_install_regenerates_a_pkgbuild_recipe_and_adds_native_runtime() {
+        let signing = SigningKey::from_bytes(&[51_u8; 32]);
+        let roots = temporary_roots("source-native-graph", &signing);
+        let source =
+            buildable_source_repository_with_dependency(&roots, &signing, Some("runtime-lib"));
+        let native = native_repository_packages(
+            &roots,
+            &signing,
+            1,
+            vec![native_package("runtime-lib", "1.0.0", 1, b"runtime\n")],
+        );
+        let (config, signature) = write_config(&roots, &signing, 1, vec![native], vec![source]);
+        let service = open_service(&roots, &config, &signature);
+
+        let installed = service.install("demo").unwrap();
+        assert_eq!(installed.route, "source");
+        assert!(roots.target.join("usr/bin/demo").exists());
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/runtime-lib")).unwrap(),
+            b"runtime\n"
+        );
+        assert!(matches!(
+            service.remove("runtime-lib"),
+            Err(ServiceError::Dependency(_))
+        ));
+        service.remove("demo").unwrap();
+        service.remove("runtime-lib").unwrap();
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
     fn equal_priority_source_collisions_require_an_explicit_provider() {
         let signing = SigningKey::from_bytes(&[32_u8; 32]);
         let roots = temporary_roots("ambiguity", &signing);
@@ -2543,6 +3938,49 @@ mod tests {
             service.search("first-source:demo").unwrap().provider,
             "first-source"
         );
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn legacy_source_catalogs_remain_readable_without_dependency_metadata() {
+        let signing = SigningKey::from_bytes(&[47_u8; 32]);
+        let roots = temporary_roots("source-catalog-migration", &signing);
+        let repository = source_repository(&roots, &signing, "legacy-source", 100, 'd');
+        let bytes = fs::read(&repository.catalog).unwrap();
+        let mut catalog: SourceCatalog = toml::from_slice(&bytes).unwrap();
+        catalog.format = LEGACY_SOURCE_CATALOG_FORMAT;
+        let signing_key_id = key_id(&signing.verifying_key().to_bytes());
+        assert!(validate_source_catalog(&catalog, &repository, &signing_key_id, 1).is_ok());
+
+        catalog.packages[0].requirements = vec![crate::dependency::package_requirement("runtime")];
+        assert!(validate_source_catalog(&catalog, &repository, &signing_key_id, 1).is_err());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn legacy_service_receipts_default_to_an_empty_dependency_closure() {
+        let signing = SigningKey::from_bytes(&[50_u8; 32]);
+        let roots = temporary_roots("service-receipt-migration", &signing);
+        let repository = native_repository(&roots, &signing, 1, "1.0.0", b"installed\n");
+        let (config, signature) = write_config(&roots, &signing, 1, vec![repository], vec![]);
+        let service = open_service(&roots, &config, &signature);
+        service.install("demo").unwrap();
+        let current = service.read_service_receipt("demo").unwrap().unwrap();
+        let mut value: toml::Value = toml::from_str(&toml::to_string(&current).unwrap()).unwrap();
+        let table = value.as_table_mut().unwrap();
+        table.insert("format".into(), toml::Value::Integer(1));
+        table.remove("requirements");
+        table.remove("provides");
+        table.remove("conflicts");
+        let legacy: ServiceReceipt = toml::from_str(&toml::to_string(&value).unwrap()).unwrap();
+        assert!(legacy.requirements.is_empty());
+        assert!(legacy.provides.is_empty());
+        assert!(legacy.conflicts.is_empty());
+        assert!(validate_service_receipt(&legacy).is_ok());
+
+        let mut invalid = legacy;
+        invalid.requirements = vec![crate::dependency::package_requirement("runtime")];
+        assert!(validate_service_receipt(&invalid).is_err());
         fs::remove_dir_all(&roots.root).unwrap();
     }
 

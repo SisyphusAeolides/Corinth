@@ -460,6 +460,7 @@ pub fn build_recipe(
         runtime: Some(RecipeRuntime {
             depends: metadata.depends.clone(),
             provides: metadata.provides.clone(),
+            conflicts: metadata.conflicts.clone(),
         }),
         policy: RecipePolicy {
             network: target.network,

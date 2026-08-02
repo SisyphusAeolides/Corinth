@@ -159,3 +159,63 @@ data Recovers : Operation -> Ownership -> Type where
 public export
 updateCannotRecoverAbsent : Recovers Updating NoOwner -> Void
 updateCannotRecoverAbsent value impossible
+
+public export
+data GraphNode = DependencyNode | RootNode
+
+public export
+data Requires : GraphNode -> GraphNode -> Type where
+  RootRequiresDependency : Requires RootNode DependencyNode
+
+public export
+data Precedes : GraphNode -> GraphNode -> Type where
+  DependencyBeforeRoot : Precedes DependencyNode RootNode
+
+public export
+requiredDependencyPrecedesRoot :
+  Requires RootNode DependencyNode -> Precedes DependencyNode RootNode
+requiredDependencyPrecedesRoot RootRequiresDependency = DependencyBeforeRoot
+
+public export
+rootCannotPrecedeDependency : Precedes RootNode DependencyNode -> Void
+rootCannotPrecedeDependency value impossible
+
+public export
+data GraphOperation = GraphInstall | GraphUpdate
+
+public export
+data GraphProgress = NoNewOwners | PartialNewOwners | AllNewOwners | ForeignOwners
+
+public export
+data RootOwnership = RootAbsent | RootStillOld | RootNowNew
+
+public export
+data GraphOutcome = RestoreOldGraph | CommitNewGraph
+
+public export
+data GraphRecovers : GraphOperation -> GraphProgress -> RootOwnership -> GraphOutcome -> Type where
+  EmptyInstallRollsBack :
+    GraphRecovers GraphInstall NoNewOwners RootAbsent RestoreOldGraph
+  PartialInstallRollsBack :
+    GraphRecovers GraphInstall PartialNewOwners RootAbsent RestoreOldGraph
+  CompleteInstallRollsForward :
+    GraphRecovers GraphInstall AllNewOwners RootNowNew CommitNewGraph
+  PartialUpdateRollsBack :
+    GraphRecovers GraphUpdate PartialNewOwners RootStillOld RestoreOldGraph
+  CompleteUpdateRollsForward :
+    GraphRecovers GraphUpdate AllNewOwners RootNowNew CommitNewGraph
+
+public export
+updateNewPartialCannotRecover :
+  GraphRecovers GraphUpdate PartialNewOwners RootNowNew outcome -> Void
+updateNewPartialCannotRecover value impossible
+
+public export
+foreignGraphCannotRecover :
+  GraphRecovers operation ForeignOwners root outcome -> Void
+foreignGraphCannotRecover value impossible
+
+public export
+completeGraphCannotRollBack :
+  GraphRecovers operation AllNewOwners RootNowNew RestoreOldGraph -> Void
+completeGraphCannotRollBack value impossible

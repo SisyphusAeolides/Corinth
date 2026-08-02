@@ -138,6 +138,8 @@ pub struct RecipeRuntime {
     pub depends: Vec<String>,
     #[serde(default)]
     pub provides: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1609,6 +1611,26 @@ fn validate_recipe(
             )));
         }
     }
+    if recipe.build.depends.iter().collect::<BTreeSet<_>>().len() != recipe.build.depends.len() {
+        return Err(HardwareError::InvalidRecipe(
+            "build dependencies contain duplicates".into(),
+        ));
+    }
+    if let Some(runtime) = &recipe.runtime {
+        for (label, values) in [
+            ("runtime dependency", &runtime.depends),
+            ("runtime capability", &runtime.provides),
+            ("runtime conflict", &runtime.conflicts),
+        ] {
+            if values.iter().any(|value| !valid_package_atom(value))
+                || values.iter().collect::<BTreeSet<_>>().len() != values.len()
+            {
+                return Err(HardwareError::InvalidRecipe(format!(
+                    "invalid or duplicate {label}"
+                )));
+            }
+        }
+    }
     if recipe.build.commands.is_empty() || recipe.build.outputs.is_empty() {
         return Err(HardwareError::InvalidRecipe(
             "build commands and outputs are required".into(),
@@ -2011,10 +2033,12 @@ fn valid_package_atom_extended(value: &str) -> bool {
 
 fn valid_version(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            !byte.is_ascii_control()
+                && !byte.is_ascii_whitespace()
+                && !matches!(byte, b'/' | b'\\' | b'@')
+        })
 }
 
 fn valid_build_system(value: &str) -> bool {

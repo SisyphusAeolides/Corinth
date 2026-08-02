@@ -9,6 +9,8 @@ pub mod arch_import;
 pub mod binary;
 pub mod command;
 pub mod crucible;
+#[cfg(feature = "host-store")]
+pub mod dependency;
 pub mod dna;
 #[cfg(feature = "host-store")]
 pub mod foreign_import;

@@ -128,3 +128,55 @@ data Recovers : Operation → Ownership → Set where
 
 update-cannot-recover-absent : Recovers updating noOwner → Empty
 update-cannot-recover-absent ()
+
+data GraphNode : Set where
+  dependencyNode rootNode : GraphNode
+
+data Requires : GraphNode → GraphNode → Set where
+  rootRequiresDependency : Requires rootNode dependencyNode
+
+data Precedes : GraphNode → GraphNode → Set where
+  dependencyBeforeRoot : Precedes dependencyNode rootNode
+
+required-dependency-precedes-root :
+  Requires rootNode dependencyNode → Precedes dependencyNode rootNode
+required-dependency-precedes-root rootRequiresDependency = dependencyBeforeRoot
+
+root-cannot-precede-dependency : Precedes rootNode dependencyNode → Empty
+root-cannot-precede-dependency ()
+
+data GraphOperation : Set where
+  graphInstall graphUpdate : GraphOperation
+
+data GraphProgress : Set where
+  noNewOwners partialNewOwners allNewOwners foreignOwners : GraphProgress
+
+data RootOwnership : Set where
+  rootAbsent rootStillOld rootNowNew : RootOwnership
+
+data GraphOutcome : Set where
+  restoreOldGraph commitNewGraph : GraphOutcome
+
+data GraphRecovers : GraphOperation → GraphProgress → RootOwnership → GraphOutcome → Set where
+  emptyInstallRollsBack :
+    GraphRecovers graphInstall noNewOwners rootAbsent restoreOldGraph
+  partialInstallRollsBack :
+    GraphRecovers graphInstall partialNewOwners rootAbsent restoreOldGraph
+  completeInstallRollsForward :
+    GraphRecovers graphInstall allNewOwners rootNowNew commitNewGraph
+  partialUpdateRollsBack :
+    GraphRecovers graphUpdate partialNewOwners rootStillOld restoreOldGraph
+  completeUpdateRollsForward :
+    GraphRecovers graphUpdate allNewOwners rootNowNew commitNewGraph
+
+update-new-partial-cannot-recover :
+  ∀ {outcome} → GraphRecovers graphUpdate partialNewOwners rootNowNew outcome → Empty
+update-new-partial-cannot-recover ()
+
+foreign-graph-cannot-recover :
+  ∀ {operation root outcome} → GraphRecovers operation foreignOwners root outcome → Empty
+foreign-graph-cannot-recover ()
+
+complete-graph-cannot-roll-back :
+  ∀ {operation} → GraphRecovers operation allNewOwners rootNowNew restoreOldGraph → Empty
+complete-graph-cannot-roll-back ()

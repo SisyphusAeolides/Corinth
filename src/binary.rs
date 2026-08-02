@@ -23,13 +23,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::dependency::{
+    PackageCapability, PackageConstraint, PackageRequirement, validate_dependency_metadata,
+};
 use crate::hardware::{
     HardwareBuildReceipt, HardwareError, HostPackageStore, MAX_OUTPUT_BYTES, VerifiedHardwarePlan,
     atomic_write, hex_digest, prepare_private_root, read_bounded,
 };
 
 pub const LEGACY_BINARY_INDEX_FORMAT: u32 = 1;
-pub const BINARY_INDEX_FORMAT: u32 = 2;
+pub const MULTIVERSION_BINARY_INDEX_FORMAT: u32 = 2;
+pub const BINARY_INDEX_FORMAT: u32 = 3;
 pub const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 pub const BINARY_PAYLOAD_FORMAT: u16 = 1;
 pub const MAX_PAYLOAD_FILES: u32 = 4096;
@@ -94,6 +98,12 @@ pub struct BinaryPackage {
     pub release: u32,
     #[serde(default)]
     pub sequence: u64,
+    #[serde(default)]
+    pub requirements: Vec<PackageRequirement>,
+    #[serde(default)]
+    pub provides: Vec<PackageCapability>,
+    #[serde(default)]
+    pub conflicts: Vec<PackageConstraint>,
     pub scope: PackageScope,
     pub repository: RepositoryAuthority,
     pub metadata_sha256: String,
@@ -114,7 +124,7 @@ impl BinaryRepositoryIndex {
     pub fn validate(&self) -> Result<(), HardwareError> {
         if !matches!(
             self.format,
-            LEGACY_BINARY_INDEX_FORMAT | BINARY_INDEX_FORMAT
+            LEGACY_BINARY_INDEX_FORMAT | MULTIVERSION_BINARY_INDEX_FORMAT | BINARY_INDEX_FORMAT
         ) || self.key_id.is_empty()
         {
             return Err(HardwareError::InvalidPlan(
@@ -129,7 +139,7 @@ impl BinaryRepositoryIndex {
                 LEGACY_BINARY_INDEX_FORMAT => {
                     package.sequence == 0 && names.insert(package.name.clone())
                 }
-                BINARY_INDEX_FORMAT => {
+                MULTIVERSION_BINARY_INDEX_FORMAT | BINARY_INDEX_FORMAT => {
                     package.sequence != 0
                         && identities.insert((package.name.clone(), package.version.clone()))
                         && sequences.insert((package.name.clone(), package.sequence))
@@ -149,6 +159,23 @@ impl BinaryRepositoryIndex {
             {
                 return Err(HardwareError::InvalidPlan(format!(
                     "invalid binary package record: {}",
+                    package.name
+                )));
+            }
+            if (self.format != BINARY_INDEX_FORMAT
+                && (!package.requirements.is_empty()
+                    || !package.provides.is_empty()
+                    || !package.conflicts.is_empty()))
+                || (self.format == BINARY_INDEX_FORMAT
+                    && validate_dependency_metadata(
+                        &package.requirements,
+                        &package.provides,
+                        &package.conflicts,
+                    )
+                    .is_err())
+            {
+                return Err(HardwareError::InvalidPlan(format!(
+                    "invalid binary dependency metadata: {}",
                     package.name
                 )));
             }
@@ -551,6 +578,9 @@ impl BinaryProvisioner {
         name: &str,
         version: Option<&str>,
     ) -> Result<HardwareBuildReceipt, HardwareError> {
+        let (_, package) = select_binary_package(&verified.index, name, version)
+            .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
+        require_dependency_free_direct_record(package)?;
         self.fetch_bytes(verified, name, version)
             .map(|(receipt, _)| receipt)
     }
@@ -613,6 +643,27 @@ impl BinaryProvisioner {
         ))
     }
 
+    /// Fetch, authenticate, and decode one system payload without mutating a
+    /// target root. The package service uses this preparation boundary to
+    /// finish every download before it opens a graph transaction journal.
+    pub(crate) fn prepare_system_payload(
+        &self,
+        verified: &VerifiedBinaryIndex,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<(HardwareBuildReceipt, BinaryPayload), HardwareError> {
+        let (_, package) = select_binary_package(&verified.index, name, version)
+            .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
+        if package.scope != PackageScope::System {
+            return Err(HardwareError::InvalidPlan(
+                "driver and firmware binaries require a verified HWD plan".into(),
+            ));
+        }
+        let (receipt, bytes) = self.fetch_bytes(verified, name, version)?;
+        let payload = decode_binary_payload(&bytes, package)?;
+        Ok((receipt, payload))
+    }
+
     pub fn install(
         &self,
         store: &HostPackageStore,
@@ -627,6 +678,7 @@ impl BinaryProvisioner {
                 "driver and firmware binaries require a verified HWD plan".into(),
             ));
         }
+        require_dependency_free_direct_record(package)?;
         let receipt = self.fetch(verified, name, version)?;
         store.install(std::slice::from_ref(&receipt))?;
         Ok(receipt)
@@ -669,13 +721,8 @@ impl BinaryProvisioner {
     ) -> Result<BinaryInstallReceipt, HardwareError> {
         let (_, package) = select_binary_package(&verified.index, name, version)
             .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
-        if package.scope != PackageScope::System {
-            return Err(HardwareError::InvalidPlan(
-                "driver and firmware binaries require a verified HWD plan".into(),
-            ));
-        }
-        let (receipt, bytes) = self.fetch_bytes(verified, name, version)?;
-        let payload = decode_binary_payload(&bytes, package)?;
+        require_dependency_free_direct_record(package)?;
+        let (receipt, payload) = self.prepare_system_payload(verified, name, version)?;
         BinaryInstallStore::open(state, target)?.install_payload(
             &payload,
             &receipt.artifact_sha256,
@@ -721,6 +768,7 @@ impl BinaryProvisioner {
                     intent.name
                 )));
             }
+            require_dependency_free_direct_record(package)?;
             receipts.push(self.fetch(verified, &intent.name, Some(&intent.version))?);
         }
         store.install(&receipts)?;
@@ -770,6 +818,7 @@ impl BinaryProvisioner {
                         intent.name
                     )));
                 }
+                require_dependency_free_direct_record(package)?;
                 let key = intent.name.clone();
                 if let Some(previous) = intents.insert(key.clone(), intent) {
                     if previous.version != intent.version
@@ -1305,6 +1354,20 @@ fn verify_artifact(bytes: &[u8], package: &BinaryPackage) -> Result<(), Hardware
     Ok(())
 }
 
+fn require_dependency_free_direct_record(package: &BinaryPackage) -> Result<(), HardwareError> {
+    if package.requirements.is_empty()
+        && package.provides.is_empty()
+        && package.conflicts.is_empty()
+    {
+        Ok(())
+    } else {
+        Err(HardwareError::InvalidPlan(format!(
+            "dependency-bearing package requires the signed package-service graph: {}",
+            package.name
+        )))
+    }
+}
+
 fn run_curl(
     url: &str,
     destination: &Path,
@@ -1347,9 +1410,11 @@ fn valid_package_name(value: &str) -> bool {
 fn valid_version(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
-        && value
-            .bytes()
-            .all(|byte| !byte.is_ascii_control() && byte != b'/' && byte != b'\\')
+        && value.bytes().all(|byte| {
+            !byte.is_ascii_control()
+                && !byte.is_ascii_whitespace()
+                && !matches!(byte, b'/' | b'\\' | b'@')
+        })
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -1377,6 +1442,9 @@ mod tests {
             version: "1.0.0".into(),
             release: 1,
             sequence: 1,
+            requirements: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
             scope,
             repository,
             metadata_sha256: "1".repeat(64),
@@ -1416,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn version_two_index_accepts_multiple_versions_and_rejects_collisions() {
+    fn current_index_accepts_multiple_versions_and_rejects_collisions() {
         let mut index = BinaryRepositoryIndex {
             format: BINARY_INDEX_FORMAT,
             repository: RepositoryAuthority::ArachNative,
@@ -1442,6 +1510,52 @@ mod tests {
         duplicate_sequence.version = "3.0.0".into();
         index.packages.push(duplicate_sequence);
         assert!(index.validate().is_err());
+    }
+
+    #[test]
+    fn version_two_index_remains_readable_but_cannot_carry_dependency_metadata() {
+        let mut index = BinaryRepositoryIndex {
+            format: MULTIVERSION_BINARY_INDEX_FORMAT,
+            repository: RepositoryAuthority::ArachNative,
+            key_id: "native-key".into(),
+            packages: vec![record(
+                PackageScope::System,
+                RepositoryAuthority::ArachNative,
+            )],
+        };
+        let mut newer = index.packages[0].clone();
+        newer.version = "2.0.0".into();
+        newer.sequence = 2;
+        index.packages.push(newer);
+        assert!(index.validate().is_ok());
+
+        index.packages[0].requirements = vec![crate::dependency::package_requirement("runtime")];
+        assert!(index.validate().is_err());
+    }
+
+    #[test]
+    fn direct_live_root_path_rejects_an_unsolved_dependency_record() {
+        let root = test_root();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let mut package = record(PackageScope::System, RepositoryAuthority::ArachNative);
+        package.requirements = vec![crate::dependency::package_requirement("runtime")];
+        let verified = VerifiedBinaryIndex {
+            index: BinaryRepositoryIndex {
+                format: BINARY_INDEX_FORMAT,
+                repository: RepositoryAuthority::ArachNative,
+                key_id: "native-key".into(),
+                packages: vec![package],
+            },
+            key_id: "native-key".into(),
+            index_sha256: "4".repeat(64),
+        };
+        let provisioner = BinaryProvisioner::new(root.join("artifacts")).unwrap();
+        assert!(matches!(
+            provisioner.install_to_root(root.join("state"), target, &verified, "demo", None,),
+            Err(HardwareError::InvalidPlan(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
