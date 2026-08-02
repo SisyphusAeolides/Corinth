@@ -1,9 +1,10 @@
 //! Signed, immutable ingress for supported upstream package ecosystems.
 //!
 //! Discovery and installation authority remain separate. A resolver may find
-//! a candidate in AUR, an Arch or CRUX repository, a locked Nix export, or
-//! crates.io, but this module accepts it only after a signed ingress lock has
-//! reduced every mutable reference to a full Git object or SHA-256 digest.
+//! a candidate in AUR, an Arch, CRUX, Fedora, Debian, Alpine, or Gentoo
+//! repository, a locked Nix export, or crates.io, but this module accepts it
+//! only after a signed ingress lock has reduced every mutable reference to a
+//! full Git object or SHA-256 digest.
 
 use alloc::{format, string::String, string::ToString, vec, vec::Vec};
 use core::fmt;
@@ -17,7 +18,8 @@ use crate::arch_import::{
     parse_pkgbuild,
 };
 use crate::foreign_import::{
-    ForeignImportError, build_foreign_recipe, parse_crux_pkgfile, parse_nix_export,
+    ForeignImportError, build_foreign_recipe, parse_alpine_apkbuild, parse_crux_pkgfile,
+    parse_debian_control, parse_fedora_spec, parse_gentoo_ebuild, parse_nix_export,
 };
 use crate::hardware::{
     RecipeCargoClosure, RecipeCargoPackage, RecipeSource, metadata_sha256, parse_recipe,
@@ -34,6 +36,10 @@ pub const MAXIMUM_UPSTREAM_METADATA_BYTES: usize = 512 * 1024;
 pub enum UniversalEcosystem {
     Arch,
     Aur,
+    Fedora,
+    Debian,
+    Alpine,
+    Gentoo,
     Crux,
     Nix,
     Cargo,
@@ -44,10 +50,21 @@ impl UniversalEcosystem {
         match self {
             Self::Arch => "arch",
             Self::Aur => "aur",
+            Self::Fedora => "fedora",
+            Self::Debian => "debian",
+            Self::Alpine => "alpine",
+            Self::Gentoo => "gentoo",
             Self::Crux => "crux",
             Self::Nix => "nix",
             Self::Cargo => "cargo",
         }
+    }
+
+    pub const fn requires_companion_source_lock(self) -> bool {
+        matches!(
+            self,
+            Self::Crux | Self::Fedora | Self::Debian | Self::Alpine | Self::Gentoo
+        )
     }
 }
 
@@ -173,6 +190,10 @@ pub fn validate_universal_import_lock(
         (
             UniversalEcosystem::Arch
             | UniversalEcosystem::Aur
+            | UniversalEcosystem::Fedora
+            | UniversalEcosystem::Debian
+            | UniversalEcosystem::Alpine
+            | UniversalEcosystem::Gentoo
             | UniversalEcosystem::Crux
             | UniversalEcosystem::Nix,
             UniversalOrigin::Git {
@@ -196,11 +217,16 @@ pub fn validate_universal_import_lock(
             }
             validate_relative_path(metadata_path)?;
             match lock.ecosystem {
-                UniversalEcosystem::Crux => {
+                ecosystem if ecosystem.requires_companion_source_lock() => {
                     let path = source_lock_path
                         .as_deref()
                         .ok_or(UniversalImportError::MissingSourceLock)?;
                     validate_relative_path(path)?;
+                    if path == metadata_path {
+                        return Err(UniversalImportError::InvalidLock(
+                            "metadata and source-lock paths must be distinct".into(),
+                        ));
+                    }
                     if !source_lock_sha256.as_deref().is_some_and(valid_digest) {
                         return Err(UniversalImportError::MissingSourceLock);
                     }
@@ -340,6 +366,48 @@ pub fn import_universal_lock(
                 parse_crux_pkgfile(&pkgfile, &source_lock).map_err(map_foreign_error)?,
                 metadata_sha256.clone(),
             )
+        }
+        (
+            UniversalEcosystem::Fedora
+            | UniversalEcosystem::Debian
+            | UniversalEcosystem::Alpine
+            | UniversalEcosystem::Gentoo,
+            UniversalOrigin::Git {
+                metadata_path,
+                metadata_sha256,
+                source_lock_path,
+                source_lock_sha256,
+                ..
+            },
+        ) => {
+            let foreign_metadata =
+                read_locked_file(repository_root, metadata_path, metadata_sha256)?;
+            let source_lock = read_locked_file(
+                repository_root,
+                source_lock_path
+                    .as_deref()
+                    .ok_or(UniversalImportError::MissingSourceLock)?,
+                source_lock_sha256
+                    .as_deref()
+                    .ok_or(UniversalImportError::MissingSourceLock)?,
+            )?;
+            let metadata = match lock.ecosystem {
+                UniversalEcosystem::Fedora => parse_fedora_spec(&foreign_metadata, &source_lock),
+                UniversalEcosystem::Debian => parse_debian_control(&foreign_metadata, &source_lock),
+                UniversalEcosystem::Alpine => {
+                    parse_alpine_apkbuild(&foreign_metadata, &source_lock)
+                }
+                UniversalEcosystem::Gentoo => {
+                    let filename = Path::new(metadata_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| UniversalImportError::UnsafePath(metadata_path.clone()))?;
+                    parse_gentoo_ebuild(filename, &foreign_metadata, &source_lock)
+                }
+                _ => unreachable!("foreign ecosystem match is exhaustive"),
+            }
+            .map_err(map_foreign_error)?;
+            (metadata, metadata_sha256.clone())
         }
         (
             UniversalEcosystem::Nix,
@@ -788,6 +856,107 @@ mod tests {
         let imported = import_universal_lock(&crux, Some(&root), &policy("demo", "cargo")).unwrap();
         assert_eq!(imported.version, "1.0.0");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signed_foreign_git_origins_translate_every_static_ecosystem() {
+        let root = temporary_directory("foreign-static");
+        let source_lock = fixed_output_manifest();
+        fs::write(root.join("sources.toml"), &source_lock).unwrap();
+        let checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let alpine = format!(
+            "pkgname=demo\npkgver=1.0.0\npkgrel=1\npkgdesc=demo\narch=x86_64\nlicense=MIT\nsource=https://example.org/demo.tar.gz\nsha256sums={checksum}\nbuild() {{ false; }}\n"
+        );
+        let inputs = [
+            (
+                UniversalEcosystem::Fedora,
+                "demo.spec",
+                b"Name: demo\nVersion: 1.0.0\nRelease: 1\nSummary: demo\nLicense: MIT\nExclusiveArch: x86_64\nSource0: https://example.org/demo.tar.gz\n%description\ndemo\n"
+                    .as_slice(),
+            ),
+            (
+                UniversalEcosystem::Debian,
+                "debian/control",
+                b"Source: demo\n\nPackage: demo\nArchitecture: amd64\nVersion: 1.0.0\nDescription: demo\n bounded metadata\n"
+                    .as_slice(),
+            ),
+            (
+                UniversalEcosystem::Alpine,
+                "APKBUILD",
+                alpine.as_bytes(),
+            ),
+            (
+                UniversalEcosystem::Gentoo,
+                "demo-1.0.0.ebuild",
+                b"EAPI=8\nDESCRIPTION=demo\nHOMEPAGE=https://example.org\nLICENSE=MIT\nKEYWORDS=~amd64\nSLOT=0\nSRC_URI=https://example.org/demo.tar.gz\nsrc_compile() { false; }\n"
+                    .as_slice(),
+            ),
+        ];
+        for (ecosystem, metadata_path, metadata) in inputs {
+            let path = root.join(metadata_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, metadata).unwrap();
+            let lock = UniversalImportLock {
+                format: UNIVERSAL_IMPORT_FORMAT,
+                ecosystem,
+                package: "demo".into(),
+                origin: UniversalOrigin::Git {
+                    repository: format!("https://example.org/{}.git", ecosystem.name()),
+                    revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                    metadata_path: metadata_path.into(),
+                    metadata_sha256: digest(metadata),
+                    source_lock_path: Some("sources.toml".into()),
+                    source_lock_sha256: Some(digest(&source_lock)),
+                    submodules: false,
+                },
+            };
+            let imported =
+                import_universal_lock(&lock, Some(&root), &policy("demo", "cargo")).unwrap();
+            let recipe = parse_recipe(&imported.recipe.bytes).unwrap();
+            assert_eq!(recipe.package.name, "demo");
+            assert_eq!(recipe.package.version, "1.0.0");
+            assert_eq!(recipe.source.len(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_git_origins_require_both_source_lock_identity_fields() {
+        for ecosystem in [
+            UniversalEcosystem::Fedora,
+            UniversalEcosystem::Debian,
+            UniversalEcosystem::Alpine,
+            UniversalEcosystem::Gentoo,
+        ] {
+            let mut lock = UniversalImportLock {
+                format: UNIVERSAL_IMPORT_FORMAT,
+                ecosystem,
+                package: "demo".into(),
+                origin: UniversalOrigin::Git {
+                    repository: format!("https://example.org/{}.git", ecosystem.name()),
+                    revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                    metadata_path: "metadata".into(),
+                    metadata_sha256: "a".repeat(64),
+                    source_lock_path: None,
+                    source_lock_sha256: None,
+                    submodules: false,
+                },
+            };
+            assert_eq!(
+                validate_universal_import_lock(&lock),
+                Err(UniversalImportError::MissingSourceLock)
+            );
+            if let UniversalOrigin::Git {
+                source_lock_path, ..
+            } = &mut lock.origin
+            {
+                *source_lock_path = Some("sources.toml".into());
+            }
+            assert_eq!(
+                validate_universal_import_lock(&lock),
+                Err(UniversalImportError::MissingSourceLock)
+            );
+        }
     }
 
     #[test]

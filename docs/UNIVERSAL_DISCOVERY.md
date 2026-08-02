@@ -46,6 +46,35 @@ corinth-discover \
 `HEAD` is convenience input only. Each output records the commit returned by
 the provider and the measured `PKGBUILD`, never `HEAD` itself.
 
+## Fedora, Debian, Alpine, and Gentoo
+
+These ecosystems use explicit HTTPS Git transports because their packaging
+trees do not share one package-to-repository namespace. Every candidate binds
+two regular files at the resolved commit: the ecosystem metadata and a
+canonical Corinth source manifest. The metadata path names a Fedora spec,
+Debian control file, Alpine APKBUILD, or versioned Gentoo ebuild. The source
+manifest independently locks package identity, dependency atoms, and every
+archive checksum or Git revision.
+
+```text
+corinth-discover \
+  --ecosystem fedora \
+  --package example \
+  --repository https://src.fedoraproject.org/rpms/example.git \
+  --reference refs/heads/rawhide \
+  --metadata-path example.spec \
+  --source-lock-path corinth-sources.toml \
+  --work /var/cache/corinth/discovery \
+  --output /var/lib/corinth/candidates/example.toml \
+  --allow-network
+```
+
+Replace `fedora` with `debian`, `alpine`, or `gentoo` and select the matching
+metadata path. Corinth does not execute RPM macros, `debian/rules`, APKBUILD
+functions, ebuild phases, or any other packaging script during discovery or
+ingestion. Unsupported dynamic metadata must go to a separately isolated
+compatibility worker and cannot be silently downgraded to the static path.
+
 ## CRUX and Nix exports
 
 CRUX and Nix support independently hosted HTTPS Git repositories. CRUX

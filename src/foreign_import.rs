@@ -1,7 +1,8 @@
-//! Safe CRUX and Nix metadata adapters.
+//! Safe static metadata adapters for foreign package ecosystems.
 //!
-//! Neither adapter evaluates a package language. CRUX Pkgfiles are limited to
-//! static assignments and are paired with an immutable source lock. Nix input
+//! No adapter evaluates a package language. CRUX Pkgfiles, Fedora specs,
+//! Debian control files, Alpine APKBUILDs, and Gentoo ebuilds are limited to
+//! bounded static metadata and paired with an immutable source lock. Nix input
 //! is a fixed-output export manifest, not a Nix expression. The resulting
 //! metadata still requires a detached-signature Arach target policy before it
 //! can become a native Corinth recipe.

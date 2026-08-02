@@ -1,24 +1,26 @@
 # Foreign repository adapters
 
-Corinth can consume packaging metadata from Arch/AUR, CRUX, and Nix without
-turning any of those package languages into an installation authority.
-External metadata is only an input to recipe generation. A detached-signature
-Arach target policy supplies architecture, package scope, build adapter,
-outputs, sandbox policy, Driver ABI metadata, health checks, and rollback
-requirements. The generated recipe must then be measured and admitted by a
-signed Corinth or Arach-HWD package intent before it can be installed.
+Corinth can consume packaging metadata from Arch/AUR, Fedora, Debian, Alpine,
+Gentoo, CRUX, Nix, and Cargo without turning any of those package languages
+into an installation authority. External metadata is only an input to recipe
+generation. A detached-signature Arach target policy supplies architecture,
+package scope, build adapter, outputs, sandbox policy, Driver ABI metadata,
+health checks, and rollback requirements. The generated recipe must then be
+measured and admitted by a signed Corinth or Arach-HWD package intent before it
+can be installed.
 
 ## Unified signed ingress
 
 `corinth-ingest` replaces format-specific orchestration with one signed lock.
-The lock separates ecosystem semantics from transport. `arch`, `aur`, `crux`,
-and `nix` origins use a pinned HTTPS Git repository, a full 40-hex revision, a
-contained metadata path, and an exact metadata SHA-256. This includes GitHub
-repositories without making GitHub an authority. CRUX additionally binds the
-companion source lock. Metadata repositories cannot enable submodules; source
-submodules, when a generated recipe needs them, remain a separately measured
-recipe concern. `cargo` origins bind an exact crates.io version,
-checksum, package metadata, and dependency atoms.
+The lock separates ecosystem semantics from transport. `arch`, `aur`,
+`fedora`, `debian`, `alpine`, `gentoo`, `crux`, and `nix` origins use a pinned
+HTTPS Git repository, a full 40-hex revision, a contained metadata path, and an
+exact metadata SHA-256. This includes GitHub repositories without making
+GitHub an authority. Fedora, Debian, Alpine, Gentoo, and CRUX additionally bind
+an independently measured companion source lock. Metadata repositories cannot
+enable submodules; source submodules, when a generated recipe needs them,
+remain a separately measured recipe concern. `cargo` origins bind an exact
+crates.io version, checksum, package metadata, and dependency atoms.
 
 ```toml
 format = 1
@@ -109,6 +111,27 @@ corinth import-pkgbuild \
 AUR is a discovery source, not a trust root. The imported recipe remains
 uninstallable until its metadata and source-lock digests appear in a signed
 Arach repository record.
+
+## Fedora, Debian, Alpine, and Gentoo
+
+The unified discovery path accepts an explicit HTTPS Git packaging repository,
+resolves one full commit, and measures both the packaging file and a companion
+Corinth source manifest. Use `--ecosystem fedora`, `debian`, `alpine`, or
+`gentoo`; all four require `--metadata-path` and `--source-lock-path`.
+
+The static adapters recognize Fedora spec preambles, Debian binary control
+stanzas, Alpine APKBUILD assignments, and Gentoo ebuild preambles. The source
+manifest must agree on package identity, architecture, dependencies, and every
+source URL and digest or Git revision. RPM macros, versioned or alternative
+dependency expressions, `debian/rules`, shell expansion, APKBUILD functions,
+ebuild phases, and unmeasured sources are never executed or inferred.
+
+After package-index admission, `corinth-ingest` re-fetches the exact packaging
+commit, remeasures both files, regenerates the canonical recipe, and checks the
+catalog-bound recipe and source-lock digests. The ordinary
+`corinth install PACKAGE` and `corinth update PACKAGE` paths perform this same
+translation through the signed source catalog; users do not invoke the format
+worker directly.
 
 ## CRUX
 

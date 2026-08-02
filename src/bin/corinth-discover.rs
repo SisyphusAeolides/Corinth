@@ -60,7 +60,11 @@ fn run() -> Result<(), String> {
             )?;
             DiscoveryRequest::Git(git_request(ecosystem, package, &flags, None)?)
         }
-        UniversalEcosystem::Crux => {
+        UniversalEcosystem::Crux
+        | UniversalEcosystem::Fedora
+        | UniversalEcosystem::Debian
+        | UniversalEcosystem::Alpine
+        | UniversalEcosystem::Gentoo => {
             require_keys(
                 &flags,
                 &[
@@ -215,6 +219,10 @@ fn parse_ecosystem(value: &str) -> Result<UniversalEcosystem, String> {
     match value {
         "arch" => Ok(UniversalEcosystem::Arch),
         "aur" => Ok(UniversalEcosystem::Aur),
+        "fedora" => Ok(UniversalEcosystem::Fedora),
+        "debian" => Ok(UniversalEcosystem::Debian),
+        "alpine" => Ok(UniversalEcosystem::Alpine),
+        "gentoo" => Ok(UniversalEcosystem::Gentoo),
         "crux" => Ok(UniversalEcosystem::Crux),
         "nix" => Ok(UniversalEcosystem::Nix),
         "cargo" => Ok(UniversalEcosystem::Cargo),
@@ -285,7 +293,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn usage() -> String {
-    "usage: corinth-discover --ecosystem <arch|aur|crux|nix|cargo> --package NAME [--version EXACT --architecture ARCH] [--repository HTTPS_GIT] [--reference <HEAD|FULL_REF|COMMIT>] [--metadata-path PATH] [--source-lock-path PATH] --work ABSOLUTE_DIRECTORY --output ABSOLUTE_CANDIDATE --allow-network".into()
+    "usage: corinth-discover --ecosystem <arch|aur|fedora|debian|alpine|gentoo|crux|nix|cargo> --package NAME [--version EXACT --architecture ARCH] [--repository HTTPS_GIT] [--reference <HEAD|FULL_REF|COMMIT>] [--metadata-path PATH] [--source-lock-path PATH] --work ABSOLUTE_DIRECTORY --output ABSOLUTE_CANDIDATE --allow-network".into()
 }
 
 #[cfg(test)]
@@ -340,5 +348,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn every_supported_ecosystem_has_an_explicit_cli_identity() {
+        for (name, ecosystem) in [
+            ("arch", UniversalEcosystem::Arch),
+            ("aur", UniversalEcosystem::Aur),
+            ("fedora", UniversalEcosystem::Fedora),
+            ("debian", UniversalEcosystem::Debian),
+            ("alpine", UniversalEcosystem::Alpine),
+            ("gentoo", UniversalEcosystem::Gentoo),
+            ("crux", UniversalEcosystem::Crux),
+            ("nix", UniversalEcosystem::Nix),
+            ("cargo", UniversalEcosystem::Cargo),
+        ] {
+            assert_eq!(parse_ecosystem(name).unwrap(), ecosystem);
+        }
+        assert!(parse_ecosystem("unknown").is_err());
     }
 }

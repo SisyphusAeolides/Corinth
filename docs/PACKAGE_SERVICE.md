@@ -193,12 +193,13 @@ packages. Source build dependencies still fail closed: they require a separate
 isolated build-root graph so build tools cannot be confused with packages
 published into the target root.
 
-Arch and AUR locks parse static PKGBUILD metadata; CRUX locks bind both a
-Pkgfile and source manifest; Nix locks consume fixed-output exports; Cargo
-locks bind the complete registry closure. GitHub can host those exact inputs,
-but hosting is transport and never package authority. Driver and firmware
-records remain outside this service route and still require a matching signed
-Arach-HWD device plan.
+Arch and AUR locks parse static PKGBUILD metadata. Fedora, Debian, Alpine,
+Gentoo, and CRUX locks bind both their bounded packaging metadata and a source
+manifest. Nix locks consume fixed-output exports, and Cargo locks bind the
+complete registry closure. GitHub can host those exact inputs, but hosting is
+transport and never package authority. Driver and firmware records remain
+outside this service route and still require a matching signed Arach-HWD device
+plan.
 
 ## Transaction recovery
 

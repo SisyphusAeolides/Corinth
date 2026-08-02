@@ -146,14 +146,17 @@ offline-cache behavior, and generation boundary are documented in
 
 ## External recipe imports
 
-`corinth-discover` resolves mutable Arch, AUR, CRUX, and Nix provider
-references into unsigned candidates containing only exact Git commits and
-measured metadata. Arch and AUR repository identities are derived from the
-package name; CRUX and Nix accept explicit HTTPS Git transports. Discovery
-cannot emit a recipe or install anything. Cargo discovery resolves an exact
-crate version into a complete `Cargo.lock`, binds every transitive registry
-archive checksum, and produces recipes that materialize the graph through an
-offline directory source. The provider contract and examples are documented in
+`corinth-discover` resolves mutable Arch, AUR, Fedora, Debian, Alpine, Gentoo,
+CRUX, and Nix provider references into unsigned candidates containing only
+exact Git commits and measured metadata. Arch and AUR repository identities
+are derived from the package name. The other Git-backed ecosystems accept an
+explicit HTTPS transport; Fedora specs, Debian control files, Alpine
+APKBUILDs, Gentoo ebuilds, and CRUX Pkgfiles also require an independently
+measured source manifest. Discovery cannot emit a recipe or install anything.
+Cargo discovery resolves an exact crate version into a complete `Cargo.lock`,
+binds every transitive registry archive checksum, and produces recipes that
+materialize the graph through an offline directory source. The provider
+contract and examples are documented in
 [`docs/UNIVERSAL_DISCOVERY.md`](docs/UNIVERSAL_DISCOVERY.md).
 
 Normal users do not invoke discovery or ingestion. Repository infrastructure
@@ -164,7 +167,8 @@ publishes their admitted outputs through a signed source catalog; the ordinary
 ingress lock and a separately signed target policy, resolves only an exact Git
 object or checksummed crates.io archive, remeasures upstream metadata, emits
 one canonical recipe, and writes a receipt binding the ingress lock, upstream
-evidence, recipe, and recipe source-lock digests. Arch and AUR PKGBUILDs, CRUX
+evidence, recipe, and recipe source-lock digests. Arch and AUR PKGBUILDs,
+Fedora specs, Debian control files, Alpine APKBUILDs, Gentoo ebuilds, CRUX
 Pkgfiles, fixed-output Nix exports, Cargo crates, and GitHub-hosted repositories
 therefore use one reproducibility boundary:
 
@@ -243,9 +247,12 @@ foreign metadata never becomes installation authority by itself. Packages that
 need dynamic upstream scripts belong in a separately sandboxed compatibility
 worker and are not silently admitted by these parsers.
 
-Arch PKGBUILD, Fedora, Debian, Alpine, Gentoo, CRUX, and fixed-output Nix
-metadata can therefore enter one measured recipe pipeline while retaining the
-native Arach signature, source-lock, artifact, and rollback requirements.
+These four static adapters also enter the signed universal ingress and source
+catalog consumed by ordinary `corinth install` and `corinth update`; the
+format-specific worker remains available for repository diagnostics. Arch
+PKGBUILD, Fedora, Debian, Alpine, Gentoo, CRUX, fixed-output Nix, and Cargo
+metadata therefore enter one measured recipe pipeline while retaining native
+Arach signature, source-lock, artifact, and rollback requirements.
 
 ## Validation
 

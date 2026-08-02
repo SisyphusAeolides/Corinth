@@ -267,15 +267,23 @@ pub fn validate_git_discovery_request(request: &GitDiscoveryRequest) -> Result<(
     }
     validate_relative_path(&request.metadata_path)?;
     match request.ecosystem {
-        UniversalEcosystem::Crux => {
+        ecosystem if ecosystem.requires_companion_source_lock() => {
             let path = request.source_lock_path.as_deref().ok_or_else(|| {
-                DiscoveryError::InvalidRequest("CRUX discovery requires a source lock".into())
+                DiscoveryError::InvalidRequest(format!(
+                    "{} discovery requires a source lock",
+                    ecosystem.name()
+                ))
             })?;
             validate_relative_path(path)?;
+            if path == request.metadata_path {
+                return Err(DiscoveryError::InvalidRequest(
+                    "metadata and source-lock paths must be distinct".into(),
+                ));
+            }
         }
         _ if request.source_lock_path.is_some() => {
             return Err(DiscoveryError::InvalidRequest(
-                "only CRUX discovery accepts a separate source lock".into(),
+                "this discovery ecosystem does not accept a separate source lock".into(),
             ));
         }
         _ => {}
@@ -763,6 +771,46 @@ mod tests {
             panic!("expected Git origin");
         };
         assert_eq!(source_lock_sha256.unwrap().len(), 64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_static_discovery_requires_and_measures_companion_source_locks() {
+        let root = temporary_directory("foreign-static");
+        fs::write(root.join("metadata"), b"bounded metadata\n").unwrap();
+        fs::write(root.join("sources.toml"), b"format = 1\n").unwrap();
+        for ecosystem in [
+            UniversalEcosystem::Fedora,
+            UniversalEcosystem::Debian,
+            UniversalEcosystem::Alpine,
+            UniversalEcosystem::Gentoo,
+        ] {
+            let mut request = GitDiscoveryRequest {
+                ecosystem,
+                package: "demo".into(),
+                repository: format!("https://example.org/{}.git", ecosystem.name()),
+                reference: "refs/heads/main".into(),
+                metadata_path: "metadata".into(),
+                source_lock_path: None,
+            };
+            assert!(validate_git_discovery_request(&request).is_err());
+            request.source_lock_path = Some("metadata".into());
+            assert!(validate_git_discovery_request(&request).is_err());
+            request.source_lock_path = Some("sources.toml".into());
+            let candidate =
+                build_git_candidate(&request, "0123456789abcdef0123456789abcdef01234567", &root)
+                    .unwrap();
+            let UniversalOrigin::Git {
+                metadata_sha256,
+                source_lock_sha256,
+                ..
+            } = candidate.origin
+            else {
+                panic!("expected Git origin");
+            };
+            assert_eq!(metadata_sha256.len(), 64);
+            assert_eq!(source_lock_sha256.unwrap().len(), 64);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

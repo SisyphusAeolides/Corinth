@@ -3258,6 +3258,120 @@ mod tests {
         }
     }
 
+    fn buildable_fedora_source_repository(
+        roots: &TestRoots,
+        signing: &SigningKey,
+    ) -> SourceRepository {
+        let provider_repository = "https://src.fedoraproject.org/rpms/demo.git";
+        let provider_revision = "3".repeat(40);
+        let source_repository = "https://example.org/demo.git";
+        let source_revision = "1".repeat(40);
+        let spec = format!(
+            "Name: demo\nVersion: 1.0.0\nRelease: 1\nSummary: demo service test\nLicense: MIT\nExclusiveArch: x86_64\nRequires: runtime-lib\nSource0: {source_repository}\n%description\ndemo\n"
+        );
+        let source_lock = format!(
+            "format = 1\n\n[package]\nname = \"demo\"\nversion = \"1.0.0\"\nrelease = 1\nsummary = \"demo service test\"\nlicense = \"MIT\"\narchitectures = [\"x86-64\"]\ndepends = [\"runtime-lib\"]\nmakedepends = []\nprovides = []\nconflicts = []\n\n[[source]]\nkind = \"git\"\nurl = \"{source_repository}\"\nrevision = \"{source_revision}\"\n"
+        );
+        let upstream = roots.root.join("fedora-upstream-metadata");
+        fs::create_dir(&upstream).unwrap();
+        fs::write(upstream.join("demo.spec"), spec.as_bytes()).unwrap();
+        fs::write(upstream.join("sources.toml"), source_lock.as_bytes()).unwrap();
+        let lock = UniversalImportLock {
+            format: UNIVERSAL_IMPORT_FORMAT,
+            ecosystem: UniversalEcosystem::Fedora,
+            package: "demo".into(),
+            origin: UniversalOrigin::Git {
+                repository: provider_repository.into(),
+                revision: provider_revision.clone(),
+                metadata_path: "demo.spec".into(),
+                metadata_sha256: hex_digest(&Sha256::digest(spec.as_bytes())),
+                source_lock_path: Some("sources.toml".into()),
+                source_lock_sha256: Some(hex_digest(&Sha256::digest(source_lock.as_bytes()))),
+                submodules: false,
+            },
+        };
+        let lock_bytes = serialize_universal_import_lock(&lock).unwrap();
+        let signed_lock = write_signed(&roots.root, "demo-fedora.lock.toml", &lock_bytes, signing);
+        let target_bytes = b"format = 1\npackage = \"demo\"\narchitecture = \"x86-64\"\nscope = \"system\"\npublish_authority = \"arach-native\"\nbuild_system = \"cargo\"\nbuild_commands = [\"cargo install --path . --root .corinth-install/usr --locked --offline\"]\noutputs = [\"@install-tree\"]\nnetwork = false\nsandbox = true\nreproducible = true\n";
+        let signed_target = write_signed(
+            &roots.root,
+            "demo-fedora.target.toml",
+            target_bytes,
+            signing,
+        );
+        let target = parse_target_policy(target_bytes).unwrap();
+        let imported = import_universal_lock(&lock, Some(&upstream), &target).unwrap();
+        let package = SourceCatalogPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            release: 1,
+            sequence: 1,
+            requirements: vec![crate::dependency::package_requirement("runtime-lib")],
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            ecosystem: UniversalEcosystem::Fedora,
+            architectures: vec!["x86-64".into()],
+            ingress_lock: signed_lock.path.to_string_lossy().into_owned(),
+            ingress_lock_sha256: signed_lock.sha256,
+            ingress_signature: signed_lock.signature_path.to_string_lossy().into_owned(),
+            ingress_signature_sha256: signed_lock.signature_sha256,
+            target_policy: signed_target.path.to_string_lossy().into_owned(),
+            target_policy_sha256: signed_target.sha256,
+            target_signature: signed_target.signature_path.to_string_lossy().into_owned(),
+            target_signature_sha256: signed_target.signature_sha256,
+            recipe_sha256: imported.recipe.metadata_sha256,
+            source_lock_sha256: imported.recipe.source_lock_sha256,
+        };
+        let catalog = SourceCatalog {
+            format: SOURCE_CATALOG_FORMAT,
+            key_id: key_id(&signing.verifying_key().to_bytes()),
+            name: "buildable-fedora".into(),
+            channel: "stable".into(),
+            generation: 1,
+            expires_unix: 4_000_000_000,
+            packages: vec![package],
+        };
+        let catalog_bytes = toml::to_string(&catalog).unwrap().into_bytes();
+        let signed_catalog = write_signed(
+            &roots.root,
+            "buildable-fedora.catalog.toml",
+            &catalog_bytes,
+            signing,
+        );
+        cache_git_source(
+            roots,
+            provider_repository,
+            &provider_revision,
+            &[
+                ("demo.spec", spec.as_bytes()),
+                ("sources.toml", source_lock.as_bytes()),
+            ],
+        );
+        let cargo_manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n";
+        let cargo_lock = b"version = 3\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        cache_git_source(
+            roots,
+            source_repository,
+            &source_revision,
+            &[
+                ("Cargo.toml", cargo_manifest),
+                ("Cargo.lock", cargo_lock),
+                ("src/main.rs", b"fn main() { println!(\"demo\"); }\n"),
+            ],
+        );
+        SourceRepository {
+            name: "buildable-fedora".into(),
+            priority: 100,
+            generation: 1,
+            channel: "stable".into(),
+            architectures: vec!["x86-64".into()],
+            catalog: signed_catalog.path.to_string_lossy().into_owned(),
+            catalog_sha256: signed_catalog.sha256,
+            signature: signed_catalog.signature_path.to_string_lossy().into_owned(),
+            signature_sha256: signed_catalog.signature_sha256,
+        }
+    }
+
     fn write_config(
         roots: &TestRoots,
         signing: &SigningKey,
@@ -3887,6 +4001,43 @@ mod tests {
         assert!(executable.is_file());
         assert!(fs::metadata(&executable).unwrap().permissions().mode() & 0o111 != 0);
         service.remove("demo").unwrap();
+        assert!(!executable.exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn signed_fedora_catalog_installs_through_the_standard_lifecycle() {
+        let signing = SigningKey::from_bytes(&[52_u8; 32]);
+        let roots = temporary_roots("fedora-source-lifecycle", &signing);
+        let source = buildable_fedora_source_repository(&roots, &signing);
+        let native = native_repository_packages(
+            &roots,
+            &signing,
+            1,
+            vec![native_package("runtime-lib", "1.0.0", 1, b"runtime\n")],
+        );
+        let (config, signature) = write_config(&roots, &signing, 1, vec![native], vec![source]);
+        let service = open_service(&roots, &config, &signature);
+        let resolution = service.search("demo").unwrap();
+        assert_eq!(
+            (resolution.provider.as_str(), resolution.route.as_str()),
+            ("buildable-fedora", "source")
+        );
+        let installed = service.install("demo").unwrap();
+        assert!(installed.changed);
+        let executable = roots.target.join("usr/bin/demo");
+        assert!(executable.is_file());
+        assert!(fs::metadata(&executable).unwrap().permissions().mode() & 0o111 != 0);
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/runtime-lib")).unwrap(),
+            b"runtime\n"
+        );
+        assert!(matches!(
+            service.remove("runtime-lib"),
+            Err(ServiceError::Dependency(_))
+        ));
+        service.remove("demo").unwrap();
+        service.remove("runtime-lib").unwrap();
         assert!(!executable.exists());
         fs::remove_dir_all(&roots.root).unwrap();
     }
