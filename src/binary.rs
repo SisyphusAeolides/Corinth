@@ -28,7 +28,8 @@ use crate::hardware::{
     atomic_write, hex_digest, prepare_private_root, read_bounded,
 };
 
-pub const BINARY_INDEX_FORMAT: u32 = 1;
+pub const LEGACY_BINARY_INDEX_FORMAT: u32 = 1;
+pub const BINARY_INDEX_FORMAT: u32 = 2;
 pub const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 pub const BINARY_PAYLOAD_FORMAT: u16 = 1;
 pub const MAX_PAYLOAD_FILES: u32 = 4096;
@@ -91,6 +92,8 @@ pub struct BinaryPackage {
     pub name: String,
     pub version: String,
     pub release: u32,
+    #[serde(default)]
+    pub sequence: u64,
     pub scope: PackageScope,
     pub repository: RepositoryAuthority,
     pub metadata_sha256: String,
@@ -109,17 +112,34 @@ pub struct VerifiedBinaryIndex {
 
 impl BinaryRepositoryIndex {
     pub fn validate(&self) -> Result<(), HardwareError> {
-        if self.format != BINARY_INDEX_FORMAT || self.key_id.is_empty() {
+        if !matches!(
+            self.format,
+            LEGACY_BINARY_INDEX_FORMAT | BINARY_INDEX_FORMAT
+        ) || self.key_id.is_empty()
+        {
             return Err(HardwareError::InvalidPlan(
                 "invalid binary repository index header".into(),
             ));
         }
         let mut names = std::collections::BTreeSet::new();
+        let mut identities = std::collections::BTreeSet::new();
+        let mut sequences = std::collections::BTreeSet::new();
         for package in &self.packages {
+            let unique_record = match self.format {
+                LEGACY_BINARY_INDEX_FORMAT => {
+                    package.sequence == 0 && names.insert(package.name.clone())
+                }
+                BINARY_INDEX_FORMAT => {
+                    package.sequence != 0
+                        && identities.insert((package.name.clone(), package.version.clone()))
+                        && sequences.insert((package.name.clone(), package.sequence))
+                }
+                _ => false,
+            };
             if !valid_package_name(&package.name)
                 || !valid_version(&package.version)
                 || package.release == 0
-                || !names.insert(package.name.clone())
+                || !unique_record
                 || !valid_digest(&package.metadata_sha256)
                 || !valid_digest(&package.artifact_sha256)
                 || !valid_digest(&package.source_lock_sha256)
@@ -147,6 +167,24 @@ impl BinaryRepositoryIndex {
         }
         Ok(())
     }
+}
+
+/// Select one record from an already validated index. An omitted version
+/// chooses the greatest publisher-assigned sequence; an exact version remains
+/// pinned even when a newer record is present.
+pub(crate) fn select_binary_package<'a>(
+    index: &'a BinaryRepositoryIndex,
+    name: &str,
+    version: Option<&str>,
+) -> Option<(usize, &'a BinaryPackage)> {
+    index
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| {
+            package.name == name && version.is_none_or(|version| package.version == version)
+        })
+        .max_by_key(|(_, package)| package.sequence)
 }
 
 pub fn verify_binary_index(
@@ -523,13 +561,7 @@ impl BinaryProvisioner {
         name: &str,
         version: Option<&str>,
     ) -> Result<(HardwareBuildReceipt, Vec<u8>), HardwareError> {
-        let package = verified
-            .index
-            .packages
-            .iter()
-            .find(|package| {
-                package.name == name && version.is_none_or(|version| package.version == version)
-            })
+        let (_, package) = select_binary_package(&verified.index, name, version)
             .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
         let filename = format!(
             "{}-{}-{}.pkg",
@@ -588,13 +620,7 @@ impl BinaryProvisioner {
         name: &str,
         version: Option<&str>,
     ) -> Result<HardwareBuildReceipt, HardwareError> {
-        let package = verified
-            .index
-            .packages
-            .iter()
-            .find(|package| {
-                package.name == name && version.is_none_or(|version| package.version == version)
-            })
+        let (_, package) = select_binary_package(&verified.index, name, version)
             .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
         if package.scope != PackageScope::System {
             return Err(HardwareError::InvalidPlan(
@@ -641,13 +667,7 @@ impl BinaryProvisioner {
         version: Option<&str>,
         replace: bool,
     ) -> Result<BinaryInstallReceipt, HardwareError> {
-        let package = verified
-            .index
-            .packages
-            .iter()
-            .find(|package| {
-                package.name == name && version.is_none_or(|version| package.version == version)
-            })
+        let (_, package) = select_binary_package(&verified.index, name, version)
             .ok_or_else(|| HardwareError::PackageNotFound(name.into()))?;
         if package.scope != PackageScope::System {
             return Err(HardwareError::InvalidPlan(
@@ -687,12 +707,9 @@ impl BinaryProvisioner {
                     "binary plan contains an unsupported verb".into(),
                 ));
             }
-            let package = verified
-                .index
-                .packages
-                .iter()
-                .find(|package| package.name == intent.name && package.version == intent.version)
-                .ok_or_else(|| HardwareError::PackageNotFound(intent.name.clone()))?;
+            let (_, package) =
+                select_binary_package(&verified.index, &intent.name, Some(&intent.version))
+                    .ok_or_else(|| HardwareError::PackageNotFound(intent.name.clone()))?;
             if package.scope != intent.scope
                 || package.repository != intent.repository
                 || package.metadata_sha256 != intent.metadata_sha256
@@ -737,9 +754,9 @@ impl BinaryProvisioner {
                         intent.name
                     )));
                 }
-                let Some(package) = verified.index.packages.iter().find(|package| {
-                    package.name == intent.name && package.version == intent.version
-                }) else {
+                let Some((_, package)) =
+                    select_binary_package(&verified.index, &intent.name, Some(&intent.version))
+                else {
                     return Err(HardwareError::PackageNotFound(intent.name.clone()));
                 };
                 if package.scope != intent.scope
@@ -772,12 +789,9 @@ impl BinaryProvisioner {
         for intent in intents.into_values() {
             let (receipt, bytes) =
                 self.fetch_bytes(verified, &intent.name, Some(&intent.version))?;
-            let package = verified
-                .index
-                .packages
-                .iter()
-                .find(|package| package.name == intent.name && package.version == intent.version)
-                .ok_or_else(|| HardwareError::PackageNotFound(intent.name.clone()))?;
+            let (_, package) =
+                select_binary_package(&verified.index, &intent.name, Some(&intent.version))
+                    .ok_or_else(|| HardwareError::PackageNotFound(intent.name.clone()))?;
             let payload = decode_binary_payload(&bytes, package)?;
             match store.install_payload(&payload, &receipt.artifact_sha256, false) {
                 Ok(result) => installed.push(result),
@@ -1362,6 +1376,7 @@ mod tests {
             name: "demo".into(),
             version: "1.0.0".into(),
             release: 1,
+            sequence: 1,
             scope,
             repository,
             metadata_sha256: "1".repeat(64),
@@ -1401,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn index_rejects_duplicate_names_and_untrusted_urls() {
+    fn version_two_index_accepts_multiple_versions_and_rejects_collisions() {
         let mut index = BinaryRepositoryIndex {
             format: BINARY_INDEX_FORMAT,
             repository: RepositoryAuthority::ArachNative,
@@ -1411,9 +1426,56 @@ mod tests {
                 RepositoryAuthority::ArachNative,
             )],
         };
-        index.packages.push(index.packages[0].clone());
+        let mut newer = index.packages[0].clone();
+        newer.version = "2.0.0".into();
+        newer.sequence = 2;
+        index.packages.push(newer.clone());
+        assert!(index.validate().is_ok());
+
+        let mut duplicate_version = newer.clone();
+        duplicate_version.sequence = 3;
+        index.packages.push(duplicate_version);
+        assert!(index.validate().is_err());
+        index.packages.truncate(2);
+
+        let mut duplicate_sequence = newer;
+        duplicate_sequence.version = "3.0.0".into();
+        index.packages.push(duplicate_sequence);
+        assert!(index.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_index_defaults_sequence_and_retains_one_record_per_name() {
+        let bytes = format!(
+            "format = 1\nrepository = \"arach-native\"\nkey_id = \"native-key\"\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nrelease = 1\nscope = \"system\"\nrepository = \"arach-native\"\nmetadata_sha256 = \"{}\"\nartifact_sha256 = \"{}\"\nsource_lock_sha256 = \"{}\"\nurl = \"https://packages.example.invalid/demo.pkg\"\nsize = 4\n",
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64)
+        );
+        let mut index: BinaryRepositoryIndex = toml::from_str(&bytes).unwrap();
+        assert_eq!(index.packages[0].sequence, 0);
+        assert!(index.validate().is_ok());
+
+        let mut second = index.packages[0].clone();
+        second.version = "2.0.0".into();
+        index.packages.push(second);
         assert!(index.validate().is_err());
         index.packages.truncate(1);
+        index.packages[0].sequence = 1;
+        assert!(index.validate().is_err());
+    }
+
+    #[test]
+    fn index_rejects_untrusted_urls_and_invalid_versions() {
+        let mut index = BinaryRepositoryIndex {
+            format: BINARY_INDEX_FORMAT,
+            repository: RepositoryAuthority::ArachNative,
+            key_id: "native-key".into(),
+            packages: vec![record(
+                PackageScope::System,
+                RepositoryAuthority::ArachNative,
+            )],
+        };
         index.packages[0].url = "http://packages.example.invalid/demo.pkg".into();
         assert!(index.validate().is_err());
         index.packages[0].url = "https://packages.example.invalid/demo.pkg".into();
@@ -1456,6 +1518,52 @@ mod tests {
         let provisioner = BinaryProvisioner::new(artifacts).unwrap();
         let receipt = provisioner.fetch(&index, "demo", None).unwrap();
         assert_eq!(receipt.artifact_sha256, package.artifact_sha256);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_selection_uses_sequence_and_honors_exact_version() {
+        let root = test_root();
+        let artifacts = root.join("artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut older = record(PackageScope::System, RepositoryAuthority::ArachNative);
+        let older_bytes = b"old!";
+        older.size = older_bytes.len() as u64;
+        older.artifact_sha256 = hex_digest(&Sha256::digest(older_bytes));
+        let mut newer = older.clone();
+        let newer_bytes = b"new!";
+        newer.version = "2.0.0".into();
+        newer.sequence = 2;
+        newer.size = newer_bytes.len() as u64;
+        newer.artifact_sha256 = hex_digest(&Sha256::digest(newer_bytes));
+        fs::write(artifacts.join("demo-1.0.0-1.pkg"), older_bytes).unwrap();
+        fs::write(artifacts.join("demo-2.0.0-1.pkg"), newer_bytes).unwrap();
+
+        let index = VerifiedBinaryIndex {
+            index: BinaryRepositoryIndex {
+                format: BINARY_INDEX_FORMAT,
+                repository: RepositoryAuthority::ArachNative,
+                key_id: "native-key".into(),
+                packages: vec![older, newer],
+            },
+            key_id: "native-key".into(),
+            index_sha256: "4".repeat(64),
+        };
+        assert!(index.index.validate().is_ok());
+        let provisioner = BinaryProvisioner::new(artifacts).unwrap();
+        assert_eq!(
+            provisioner.fetch(&index, "demo", None).unwrap().version,
+            "2.0.0"
+        );
+        assert_eq!(
+            provisioner
+                .fetch(&index, "demo", Some("1.0.0"))
+                .unwrap()
+                .version,
+            "1.0.0"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

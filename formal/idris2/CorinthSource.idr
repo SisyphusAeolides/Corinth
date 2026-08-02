@@ -124,6 +124,24 @@ nativePresentCannotSelectSource : Resolution NativePresent SourceRoute -> Void
 nativePresentCannotSelectSource value impossible
 
 public export
+data AtLeast : Nat -> Nat -> Type where
+  SameSequence : AtLeast current current
+  LaterSequence : AtLeast installed selected -> AtLeast installed (S selected)
+
+public export
+data UpdateSelection : Nat -> Nat -> Type where
+  MonotonicUpdate : AtLeast installed selected -> UpdateSelection installed selected
+
+public export
+positiveAtLeastZeroImpossible : AtLeast (S installed) Z -> Void
+positiveAtLeastZeroImpossible value impossible
+
+public export
+positiveSequenceCannotSelectZero : UpdateSelection (S installed) Z -> Void
+positiveSequenceCannotSelectZero (MonotonicUpdate evidence) =
+  positiveAtLeastZeroImpossible evidence
+
+public export
 data Ownership = NoOwner | OldOwner | NewOwner
 
 public export

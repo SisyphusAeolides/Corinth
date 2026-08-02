@@ -2,6 +2,8 @@
 
 module CorinthAuthority where
 
+open import Agda.Builtin.Nat using (Nat; zero; suc)
+
 data Empty : Set where
 
 Not : Set -> Set
@@ -96,6 +98,19 @@ data Resolution : NativeAvailability → Route → Set where
 
 native-present-cannot-select-source : Resolution nativePresent sourceRoute → Empty
 native-present-cannot-select-source ()
+
+data AtLeast (installed : Nat) : Nat → Set where
+  sameSequence : AtLeast installed installed
+  laterSequence : ∀ {selected} → AtLeast installed selected → AtLeast installed (suc selected)
+
+data UpdateSelection : Nat → Nat → Set where
+  monotonicUpdate : ∀ {installed selected} → AtLeast installed selected → UpdateSelection installed selected
+
+positive-at-least-zero-impossible : ∀ {installed} → AtLeast (suc installed) zero → Empty
+positive-at-least-zero-impossible ()
+
+positive-sequence-cannot-select-zero : ∀ {installed} → UpdateSelection (suc installed) zero → Empty
+positive-sequence-cannot-select-zero (monotonicUpdate evidence) = positive-at-least-zero-impossible evidence
 
 data Ownership : Set where
   noOwner oldOwner newOwner : Ownership

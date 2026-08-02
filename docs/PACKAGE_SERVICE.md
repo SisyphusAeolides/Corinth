@@ -20,6 +20,14 @@ one configured provider explicitly. Ecosystem namespaces such as
 `aur:PACKAGE` and `cargo:PACKAGE` are also accepted when more than one source
 catalog is configured.
 
+Signed native index format `2` and signed source catalogs may both retain
+multiple exact versions. An unversioned request selects the greatest
+publisher-assigned package `sequence`; Corinth deliberately does not compare
+foreign version syntaxes. Exact pins can select an older retained version for
+initial installation, while updates still reject any sequence lower than the
+installed receipt. Legacy native index format `1` remains readable as a
+single-version index with sequence zero.
+
 ## Resolution contract
 
 One invocation authenticates every configured index and source catalog before
@@ -36,7 +44,7 @@ Resolution follows these rules:
 4. accept duplicate evidence only when the complete package identity agrees;
 5. report conflicting equal-priority providers as ambiguous;
 6. on update, retain the installed provider, route, and channel and enforce
-   monotonic service, provider, and package generations.
+   monotonic service and provider generations plus package sequence.
 
 `remove` never searches an upstream repository. It uses the local service
 provenance receipt and the binary ownership receipt, verifies that they agree,

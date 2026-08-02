@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::arch_import::{RecipeTargetPolicy, parse_target_policy};
 use crate::binary::{
     BinaryInstallReceipt, BinaryInstallStore, BinaryProvisioner, VerifiedBinaryIndex,
-    verify_binary_index,
+    select_binary_package, verify_binary_index,
 };
 use crate::hardware::{
     HardwareError, HardwareProvisioner, atomic_write, metadata_sha256, prepare_private_root,
@@ -328,7 +328,7 @@ impl ResolvedPackage {
 
     fn package_sequence(&self) -> u64 {
         match self {
-            Self::Native(_) => 0,
+            Self::Native(candidate) => candidate.record().sequence,
             Self::Source(candidate) => candidate.package.sequence,
         }
     }
@@ -359,9 +359,10 @@ impl ResolvedPackage {
             Self::Native(candidate) => {
                 let package = candidate.record();
                 format!(
-                    "native:{}:{}:{}:{}:{}",
+                    "native:{}:{}:{}:{}:{}:{}",
                     package.version,
                     package.release,
+                    package.sequence,
                     package.artifact_sha256,
                     package.metadata_sha256,
                     package.source_lock_sha256
@@ -733,20 +734,9 @@ impl PackageService {
                     repository.name
                 )));
             }
-            if let Some((record_index, _)) =
-                verified
-                    .index
-                    .packages
-                    .iter()
-                    .enumerate()
-                    .find(|(_, package)| {
-                        package.name == selector.name
-                            && package.scope == PackageScope::System
-                            && selector
-                                .version
-                                .as_deref()
-                                .is_none_or(|version| package.version == version)
-                    })
+            if let Some((record_index, package)) =
+                select_binary_package(&verified.index, &selector.name, selector.version.as_deref())
+                && package.scope == PackageScope::System
             {
                 candidates.push(ResolvedPackage::Native(Box::new(NativeCandidate {
                     repository: repository.clone(),
@@ -846,7 +836,7 @@ impl PackageService {
             service_generation: self.config.generation,
             service_config_sha256: self.config_sha256.clone(),
             provider_generation: candidate.repository.generation,
-            package_sequence: 0,
+            package_sequence: package.sequence,
             artifact_sha256: package.artifact_sha256.clone(),
             origin: ServiceOrigin::Native {
                 index_sha256: candidate.verified.index_sha256.clone(),
@@ -1620,10 +1610,9 @@ fn validate_service_receipt(receipt: &ServiceReceipt) -> Result<(), ServiceError
             metadata_sha256,
             source_lock_sha256,
         } => {
-            if receipt.package_sequence != 0
-                || ![index_sha256, metadata_sha256, source_lock_sha256]
-                    .into_iter()
-                    .all(|digest| valid_digest(digest))
+            if ![index_sha256, metadata_sha256, source_lock_sha256]
+                .into_iter()
+                .all(|digest| valid_digest(digest))
             {
                 return Err(ServiceError::State("invalid native service receipt".into()));
             }
@@ -2098,31 +2087,22 @@ mod tests {
         version: &str,
         contents: &[u8],
     ) -> NativeRepository {
+        native_repository_versions(
+            roots,
+            signing,
+            generation,
+            vec![(version, generation, contents)],
+        )
+    }
+
+    fn native_repository_versions(
+        roots: &TestRoots,
+        signing: &SigningKey,
+        generation: u64,
+        records: Vec<(&str, u64, &[u8])>,
+    ) -> NativeRepository {
         let metadata_sha256 = "a".repeat(64);
         let source_lock_sha256 = "b".repeat(64);
-        let mut package = BinaryPackage {
-            name: "demo".into(),
-            version: version.into(),
-            release: 1,
-            scope: PackageScope::System,
-            repository: RepositoryAuthority::ArachNative,
-            metadata_sha256,
-            artifact_sha256: "c".repeat(64),
-            source_lock_sha256,
-            url: format!("https://packages.example/demo-{version}.pkg"),
-            size: 1,
-        };
-        let payload = encode_binary_payload(
-            &package,
-            &[BinaryPayloadFile {
-                path: "usr/bin/demo".into(),
-                mode: 0o755,
-                bytes: contents.to_vec(),
-            }],
-        )
-        .unwrap();
-        package.artifact_sha256 = hex_digest(&Sha256::digest(&payload));
-        package.size = payload.len() as u64;
         let binary_cache = roots.artifacts.join("binary");
         if !binary_cache.exists() {
             fs::DirBuilder::new()
@@ -2131,12 +2111,40 @@ mod tests {
                 .create(&binary_cache)
                 .unwrap();
         }
-        fs::write(binary_cache.join(format!("demo-{version}-1.pkg")), payload).unwrap();
+        let mut packages = Vec::with_capacity(records.len());
+        for (version, sequence, contents) in records {
+            let mut package = BinaryPackage {
+                name: "demo".into(),
+                version: version.into(),
+                release: 1,
+                sequence,
+                scope: PackageScope::System,
+                repository: RepositoryAuthority::ArachNative,
+                metadata_sha256: metadata_sha256.clone(),
+                artifact_sha256: "c".repeat(64),
+                source_lock_sha256: source_lock_sha256.clone(),
+                url: format!("https://packages.example/demo-{version}.pkg"),
+                size: 1,
+            };
+            let payload = encode_binary_payload(
+                &package,
+                &[BinaryPayloadFile {
+                    path: "usr/bin/demo".into(),
+                    mode: 0o755,
+                    bytes: contents.to_vec(),
+                }],
+            )
+            .unwrap();
+            package.artifact_sha256 = hex_digest(&Sha256::digest(&payload));
+            package.size = payload.len() as u64;
+            fs::write(binary_cache.join(format!("demo-{version}-1.pkg")), payload).unwrap();
+            packages.push(package);
+        }
         let index = BinaryRepositoryIndex {
             format: BINARY_INDEX_FORMAT,
             repository: RepositoryAuthority::ArachNative,
             key_id: key_id(&signing.verifying_key().to_bytes()),
-            packages: vec![package],
+            packages,
         };
         let bytes = toml::to_string(&index).unwrap().into_bytes();
         let signed = write_signed(
@@ -2436,6 +2444,64 @@ mod tests {
         assert!(removed.changed);
         assert!(!roots.target.join("usr/bin/demo").exists());
         assert!(service_v2.read_service_receipt("demo").unwrap().is_none());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn native_exact_install_and_default_update_use_monotonic_sequence() {
+        let signing = SigningKey::from_bytes(&[37_u8; 32]);
+        let roots = temporary_roots("native-multiversion", &signing);
+        let native = native_repository_versions(
+            &roots,
+            &signing,
+            1,
+            vec![
+                ("1.0.0", 10, b"pinned-old\n"),
+                ("2.0.0", 20, b"default-new\n"),
+            ],
+        );
+        let (config, signature) = write_config(&roots, &signing, 1, vec![native], vec![]);
+        let service = open_service(&roots, &config, &signature);
+
+        let resolution = service.search("demo").unwrap();
+        assert_eq!(
+            (resolution.version.as_str(), resolution.package_sequence),
+            ("2.0.0", 20)
+        );
+        let installed = service.install("demo@1.0.0").unwrap();
+        assert_eq!(installed.version, "1.0.0");
+        assert_eq!(
+            service
+                .read_service_receipt("demo")
+                .unwrap()
+                .unwrap()
+                .package_sequence,
+            10
+        );
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/demo")).unwrap(),
+            b"pinned-old\n"
+        );
+
+        let updated = service.update("demo").unwrap();
+        assert_eq!(updated.version, "2.0.0");
+        assert_eq!(
+            service
+                .read_service_receipt("demo")
+                .unwrap()
+                .unwrap()
+                .package_sequence,
+            20
+        );
+        assert_eq!(
+            fs::read(roots.target.join("usr/bin/demo")).unwrap(),
+            b"default-new\n"
+        );
+        assert!(matches!(
+            service.update("demo@1.0.0"),
+            Err(ServiceError::Downgrade(_))
+        ));
+        service.remove("demo").unwrap();
         fs::remove_dir_all(&roots.root).unwrap();
     }
 

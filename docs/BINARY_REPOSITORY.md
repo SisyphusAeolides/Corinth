@@ -5,10 +5,10 @@ index is TOML payload signed by an Arach-HWD key whose scope is exactly
 `package-index`; a hardware-profile key cannot authorize a native package
 index.
 
-The index format is version `1`:
+The current index format is version `2`:
 
 ```toml
-format = 1
+format = 2
 repository = "arach-native"
 key_id = "native-index-2026"
 
@@ -16,6 +16,7 @@ key_id = "native-index-2026"
 name = "cosmic-session"
 version = "1.0.0"
 release = 1
+sequence = 184
 scope = "system"
 repository = "arach-native"
 metadata_sha256 = "<64 hex characters>"
@@ -28,8 +29,20 @@ size = 123456
 Corinth validates the complete record before it downloads anything: package
 identity, authority/scope, HTTPS-only transport, bounded size, and all three
 digests. The detached signature must identify the same `key_id` in the index.
-An index may contain one exact record per package name; version selection is
-therefore deterministic.
+Version `2` may retain several exact versions of one package. Every record has
+a nonzero publisher-assigned `sequence`; both `(name, version)` and
+`(name, sequence)` must be unique. With no version selector Corinth chooses
+the record with the greatest sequence. `PACKAGE@VERSION` pins one exact
+version, independent of record order. Corinth does not infer precedence from
+ecosystem-specific version strings, and an update cannot move below the
+installed package sequence.
+
+Version `1` indexes remain readable. Their package records omit `sequence`,
+which defaults to zero, and they retain the original one-record-per-name rule.
+New repository publications should use version `2`. One release is currently
+admitted for each `(name, version)` identity; a repository publishes a changed
+release by advancing both its package sequence and provider generation, while
+retaining both releases requires distinct version labels.
 
 ## CLI
 

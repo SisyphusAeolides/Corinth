@@ -102,12 +102,15 @@ corinth update example
 corinth remove example
 ```
 
-Native Arach packages outrank source catalogs. Equal-priority conflicts fail
-as ambiguous; `PROVIDER:PACKAGE` is the explicit override. Updates retain the
-installed provider and channel and reject lower service, repository, or
-package generations. Removal is entirely receipt-driven and offline. Signed
-source entries run the complete immutable-lock, target-policy, canonical
-recipe, sandboxed build, measurement, ownership, and recovery-journal path.
+Native Arach packages outrank source catalogs. Native indexes and source
+catalogs retain multiple exact versions and use a signed monotonic sequence
+for deterministic defaults; `PACKAGE@VERSION` is an exact pin. Equal-priority
+conflicts fail as ambiguous; `PROVIDER:PACKAGE` is the explicit override.
+Updates retain the installed provider and channel and reject lower service,
+repository, or package sequences. Removal is entirely receipt-driven and
+offline. Signed source entries run the complete immutable-lock, target-policy,
+canonical recipe, sandboxed build, measurement, ownership, and
+recovery-journal path.
 The configuration and source-catalog formats are documented in
 [`docs/PACKAGE_SERVICE.md`](docs/PACKAGE_SERVICE.md).
 
