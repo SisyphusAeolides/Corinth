@@ -219,3 +219,22 @@ public export
 completeGraphCannotRollBack :
   GraphRecovers operation AllNewOwners RootNowNew RestoreOldGraph -> Void
 completeGraphCannotRollBack value impossible
+
+public export
+data BuildInputTrust = SignedNativeInput | SourceBuildInput
+
+public export
+data BuildPlane = BuildSandbox | TargetRoot
+
+public export
+data BuildVisible : BuildInputTrust -> BuildPlane -> Type where
+  ReadOnlyNativeBuildMount : BuildVisible SignedNativeInput BuildSandbox
+
+public export
+sourceCannotEnterBuildClosure : BuildVisible SourceBuildInput plane -> Void
+sourceCannotEnterBuildClosure value impossible
+
+public export
+buildDependencyCannotPublishToTarget :
+  BuildVisible SignedNativeInput TargetRoot -> Void
+buildDependencyCannotPublishToTarget value impossible

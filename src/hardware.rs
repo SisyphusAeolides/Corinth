@@ -35,6 +35,7 @@ pub const MAX_RECIPE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub const TARGET_ARCH: &str = "x86-64";
 const SANDBOX_PROGRAM: &str = "/usr/bin/bwrap";
+const BUILD_DEPENDENCY_MOUNT: &str = "/corinth-build";
 
 /// Digest helpers are public so the Arach-Packages forge and HWD profile
 /// generator can compute the exact values that cross the plan boundary.
@@ -686,6 +687,7 @@ impl HardwareProvisioner {
         &self,
         recipe_bytes: &[u8],
         compiler: &CompilerTarget,
+        build_dependency_root: Option<&Path>,
     ) -> Result<HardwareBuildReceipt, HardwareError> {
         fs::create_dir_all(&self.work_root)?;
         fs::create_dir_all(&self.artifact_root)?;
@@ -731,6 +733,7 @@ impl HardwareProvisioner {
                 recipe.policy.network,
                 compiler,
                 self.allow_host_toolchains,
+                build_dependency_root,
             )?;
         } else {
             for command in &recipe.build.commands {
@@ -741,6 +744,7 @@ impl HardwareProvisioner {
                     recipe.policy.network,
                     compiler,
                     self.allow_host_toolchains,
+                    build_dependency_root,
                 )?;
             }
         }
@@ -1028,6 +1032,7 @@ impl HardwareProvisioner {
                 recipe.policy.network,
                 compiler,
                 self.allow_host_toolchains,
+                None,
             )?;
         } else if is_fixed_kernel_recipe(&recipe) {
             run_arach_kernel_workspace(
@@ -1045,6 +1050,7 @@ impl HardwareProvisioner {
                     recipe.policy.network,
                     compiler,
                     self.allow_host_toolchains,
+                    None,
                 )?;
             }
         }
@@ -2291,8 +2297,11 @@ fn run_kernel_cargo(
         directory,
         false,
         environment,
-        Some(compiler),
-        allow_host_toolchains,
+        SandboxBuildContext {
+            compiler: Some(compiler),
+            allow_host_toolchains,
+            build_dependency_root: None,
+        },
     )?;
     if status.success() {
         Ok(())
@@ -2322,6 +2331,7 @@ fn run_build_command(
     network: bool,
     compiler: &CompilerTarget,
     allow_host_toolchains: bool,
+    build_dependency_root: Option<&Path>,
 ) -> Result<(), HardwareError> {
     let argv = parse_command(command)?;
     if argv.is_empty() || !allowed_program(system, argv[0]) {
@@ -2333,8 +2343,11 @@ fn run_build_command(
         directory,
         network,
         &[],
-        Some(compiler),
-        allow_host_toolchains,
+        SandboxBuildContext {
+            compiler: Some(compiler),
+            allow_host_toolchains,
+            build_dependency_root,
+        },
     )?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(command.into()));
@@ -2352,6 +2365,7 @@ fn run_cosmic_workspace(
     network: bool,
     compiler: &CompilerTarget,
     allow_host_toolchains: bool,
+    build_dependency_root: Option<&Path>,
 ) -> Result<(), HardwareError> {
     let justfile = directory.join("justfile");
     let metadata = fs::symlink_metadata(&justfile)
@@ -2367,6 +2381,7 @@ fn run_cosmic_workspace(
         network,
         compiler,
         allow_host_toolchains,
+        build_dependency_root,
     )?;
     let install_root = directory.join(".corinth-install");
     if let Ok(existing) = fs::symlink_metadata(&install_root) {
@@ -2385,6 +2400,7 @@ fn run_cosmic_workspace(
         network,
         compiler,
         allow_host_toolchains,
+        build_dependency_root,
     )?;
     install_cosmic_greeter_config(directory, &install_root)?;
     reject_symlinks(&install_root)
@@ -2423,6 +2439,7 @@ fn run_cosmic_phase(
     network: bool,
     compiler: &CompilerTarget,
     allow_host_toolchains: bool,
+    build_dependency_root: Option<&Path>,
 ) -> Result<(), HardwareError> {
     let status = run_sandboxed(
         "just",
@@ -2430,8 +2447,11 @@ fn run_cosmic_phase(
         directory,
         network,
         &[],
-        Some(compiler),
-        allow_host_toolchains,
+        SandboxBuildContext {
+            compiler: Some(compiler),
+            allow_host_toolchains,
+            build_dependency_root,
+        },
     )?;
     if !status.success() {
         return Err(HardwareError::CommandFailed(format!(
@@ -2448,14 +2468,20 @@ fn run_cosmic_phase(
 /// package caches are read-only, HOME and temporary state are private, all
 /// capabilities are dropped, and offline recipes receive a distinct network
 /// namespace. A missing or mutable sandbox executable is a hard failure.
+#[derive(Clone, Copy)]
+struct SandboxBuildContext<'a> {
+    compiler: Option<&'a CompilerTarget>,
+    allow_host_toolchains: bool,
+    build_dependency_root: Option<&'a Path>,
+}
+
 fn run_sandboxed(
     program: &str,
     arguments: &[&str],
     directory: &Path,
     network: bool,
     environment: &[(&str, &str)],
-    compiler: Option<&CompilerTarget>,
-    allow_host_toolchains: bool,
+    context: SandboxBuildContext<'_>,
 ) -> Result<std::process::ExitStatus, HardwareError> {
     validate_sandbox_backend()?;
     let source = fs::canonicalize(directory)
@@ -2469,7 +2495,13 @@ fn run_sandboxed(
     }
 
     let mut command = Command::new(SANDBOX_PROGRAM);
-    append_sandbox_boundary(&mut command, &source, network, allow_host_toolchains)?;
+    append_sandbox_boundary(
+        &mut command,
+        &source,
+        network,
+        context.allow_host_toolchains,
+        context.build_dependency_root,
+    )?;
     for (name, value) in environment {
         if !valid_environment_name(name) || value.contains('\0') {
             return Err(HardwareError::CommandRejected(format!(
@@ -2478,7 +2510,7 @@ fn run_sandboxed(
         }
         command.args(["--setenv", name, value]);
     }
-    if let Some(compiler) = compiler {
+    if let Some(compiler) = context.compiler {
         append_compiler_environment(&mut command, compiler)?;
     }
     command
@@ -2620,6 +2652,7 @@ fn append_sandbox_boundary(
     source: &Path,
     network: bool,
     allow_host_toolchains: bool,
+    build_dependency_root: Option<&Path>,
 ) -> Result<(), HardwareError> {
     command.args([
         "--die-with-parent",
@@ -2670,6 +2703,33 @@ fn append_sandbox_boundary(
         command.arg("--share-net");
     }
 
+    let build_dependency_root = build_dependency_root
+        .map(|root| {
+            if !root.is_absolute() {
+                return Err(HardwareError::CommandRejected(
+                    "build dependency root must be absolute".into(),
+                ));
+            }
+            let metadata = fs::symlink_metadata(root)
+                .map_err(|error| HardwareError::CommandRejected(error.to_string()))?;
+            let canonical = fs::canonicalize(root)
+                .map_err(|error| HardwareError::CommandRejected(error.to_string()))?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.permissions().mode() & 0o077 != 0
+                || canonical != root
+            {
+                return Err(HardwareError::CommandRejected(
+                    "build dependency root must be a private real directory".into(),
+                ));
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
+    if let Some(root) = &build_dependency_root {
+        command.args(["--ro-bind", path_str(root)?, BUILD_DEPENDENCY_MOUNT]);
+    }
+
     for path in [
         "/etc/alternatives",
         "/etc/hosts",
@@ -2685,6 +2745,10 @@ fn append_sandbox_boundary(
 
     let mut tool_roots = BTreeSet::new();
     let mut sandbox_path = vec![PathBuf::from("/usr/bin")];
+    if build_dependency_root.is_some() {
+        sandbox_path.insert(0, PathBuf::from("/corinth-build/usr/sbin"));
+        sandbox_path.insert(0, PathBuf::from("/corinth-build/usr/bin"));
+    }
     if allow_host_toolchains {
         sandbox_path.insert(0, PathBuf::from("/usr/local/bin"));
         for name in ["RUSTUP_HOME", "IDRIS2_PREFIX", "AGDA_DIR"] {
@@ -2746,6 +2810,45 @@ fn append_sandbox_boundary(
         .args(["--setenv", "SOURCE_DATE_EPOCH", "1"])
         .args(["--setenv", "GIT_CONFIG_NOSYSTEM", "1"])
         .args(["--setenv", "RUSTUP_NO_UPDATE_CHECK", "1"]);
+    if build_dependency_root.is_some() {
+        command
+            .args(["--setenv", "CORINTH_BUILD_ROOT", BUILD_DEPENDENCY_MOUNT])
+            .args([
+                "--setenv",
+                "PKG_CONFIG_SYSROOT_DIR",
+                BUILD_DEPENDENCY_MOUNT,
+            ])
+            .args([
+                "--setenv",
+                "PKG_CONFIG_LIBDIR",
+                "/corinth-build/usr/lib/pkgconfig:/corinth-build/usr/lib64/pkgconfig:/corinth-build/usr/share/pkgconfig",
+            ])
+            .args([
+                "--setenv",
+                "CMAKE_PREFIX_PATH",
+                "/corinth-build/usr",
+            ])
+            .args([
+                "--setenv",
+                "CPATH",
+                "/corinth-build/usr/include",
+            ])
+            .args([
+                "--setenv",
+                "LIBRARY_PATH",
+                "/corinth-build/usr/lib:/corinth-build/usr/lib64",
+            ])
+            .args([
+                "--setenv",
+                "LD_LIBRARY_PATH",
+                "/corinth-build/usr/lib:/corinth-build/usr/lib64",
+            ])
+            .args([
+                "--setenv",
+                "ACLOCAL_PATH",
+                "/corinth-build/usr/share/aclocal",
+            ]);
+    }
     if !network {
         command.args(["--setenv", "CARGO_NET_OFFLINE", "true"]);
     }
@@ -3427,8 +3530,11 @@ mod tests {
             &root,
             true,
             &[],
-            None,
-            true,
+            SandboxBuildContext {
+                compiler: None,
+                allow_host_toolchains: true,
+                build_dependency_root: None,
+            },
         )
         .unwrap();
         if !status.success() {
@@ -3438,9 +3544,20 @@ mod tests {
         }
         assert_eq!(fs::read(root.join("sandbox-write")).unwrap(), b"sealed");
         assert!(
-            run_sandboxed("cargo", &["--version"], &root, true, &[], None, true)
-                .unwrap()
-                .success()
+            run_sandboxed(
+                "cargo",
+                &["--version"],
+                &root,
+                true,
+                &[],
+                SandboxBuildContext {
+                    compiler: None,
+                    allow_host_toolchains: true,
+                    build_dependency_root: None,
+                },
+            )
+            .unwrap()
+            .success()
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -3450,7 +3567,7 @@ mod tests {
     fn offline_boundary_never_retains_the_callers_network_namespace() {
         let root = std::env::temp_dir();
         let mut offline = Command::new(SANDBOX_PROGRAM);
-        append_sandbox_boundary(&mut offline, &root, false, true).unwrap();
+        append_sandbox_boundary(&mut offline, &root, false, true, None).unwrap();
         let offline = offline
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -3459,7 +3576,7 @@ mod tests {
         assert!(!offline.iter().any(|argument| argument == "--share-net"));
 
         let mut online = Command::new(SANDBOX_PROGRAM);
-        append_sandbox_boundary(&mut online, &root, true, true).unwrap();
+        append_sandbox_boundary(&mut online, &root, true, true, None).unwrap();
         assert!(online.get_args().any(|argument| argument == "--share-net"));
     }
 
@@ -3467,7 +3584,7 @@ mod tests {
     fn package_service_boundary_excludes_mutable_host_toolchains() {
         let root = std::env::temp_dir();
         let mut command = Command::new(SANDBOX_PROGRAM);
-        append_sandbox_boundary(&mut command, &root, false, false).unwrap();
+        append_sandbox_boundary(&mut command, &root, false, false, None).unwrap();
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -3480,6 +3597,53 @@ mod tests {
         for value in [".cargo", ".rustup", ".idris2", ".agda", "RUSTUP_HOME"] {
             assert!(!arguments.iter().any(|argument| argument.contains(value)));
         }
+    }
+
+    #[test]
+    fn package_service_mounts_build_dependencies_read_only_with_bounded_paths() {
+        let root =
+            std::env::temp_dir().join(format!("corinth-build-dependencies-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(SANDBOX_PROGRAM);
+        append_sandbox_boundary(&mut command, &root, false, false, Some(&root)).unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let root_text = root.to_string_lossy();
+        assert!(
+            arguments.windows(3).any(|window| {
+                window == ["--ro-bind", root_text.as_ref(), BUILD_DEPENDENCY_MOUNT]
+            })
+        );
+        assert!(arguments.windows(3).any(|window| {
+            window
+                == [
+                    "--setenv",
+                    "PATH",
+                    "/corinth-build/usr/bin:/corinth-build/usr/sbin:/usr/bin",
+                ]
+        }));
+        for (name, value) in [
+            ("CORINTH_BUILD_ROOT", "/corinth-build"),
+            ("PKG_CONFIG_SYSROOT_DIR", "/corinth-build"),
+            ("CMAKE_PREFIX_PATH", "/corinth-build/usr"),
+        ] {
+            assert!(
+                arguments
+                    .windows(3)
+                    .any(|window| window == ["--setenv", name, value])
+            );
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut rejected = Command::new(SANDBOX_PROGRAM);
+        assert!(matches!(
+            append_sandbox_boundary(&mut rejected, &root, false, false, Some(&root)),
+            Err(HardwareError::CommandRejected(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

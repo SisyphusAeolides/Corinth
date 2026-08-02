@@ -180,3 +180,20 @@ foreign-graph-cannot-recover ()
 complete-graph-cannot-roll-back :
   ∀ {operation} → GraphRecovers operation allNewOwners rootNowNew restoreOldGraph → Empty
 complete-graph-cannot-roll-back ()
+
+data BuildInputTrust : Set where
+  signedNativeInput sourceBuildInput : BuildInputTrust
+
+data BuildPlane : Set where
+  buildSandbox targetRoot : BuildPlane
+
+data BuildVisible : BuildInputTrust → BuildPlane → Set where
+  readOnlyNativeBuildMount : BuildVisible signedNativeInput buildSandbox
+
+source-cannot-enter-build-closure :
+  ∀ {plane} → BuildVisible sourceBuildInput plane → Empty
+source-cannot-enter-build-closure ()
+
+build-dependency-cannot-publish-to-target :
+  BuildVisible signedNativeInput targetRoot → Empty
+build-dependency-cannot-publish-to-target ()

@@ -117,8 +117,11 @@ writes one graph journal, installs new dependencies, and commits the requested
 root last. Interrupted partial graphs roll back when the root is absent or
 still old; fully owned graphs roll forward. Signed source entries run the same
 graph boundary after the immutable-lock, target-policy, canonical recipe,
-sandboxed build, and measurement checks. Source build dependencies remain
-blocked until they can run through a separate isolated build-root graph.
+sandboxed build, and measurement checks. Source build dependencies resolve as
+a separate dependency-first closure from authenticated native indexes. Corinth
+materializes that closure in a fresh private root, exposes it read-only only to
+the build sandbox, records every selected artifact in the source receipt, and
+removes the root without publishing build-only tools into the target system.
 The configuration and source-catalog formats are documented in
 [`docs/PACKAGE_SERVICE.md`](docs/PACKAGE_SERVICE.md).
 

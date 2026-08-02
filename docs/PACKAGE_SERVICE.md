@@ -189,9 +189,15 @@ installations and caches are not mounted into the build sandbox.
 Source recipes may carry runtime dependency, capability, and conflict atoms
 when the signed catalog metadata agrees with the regenerated canonical recipe.
 Those runtime requirements enter the same solver and graph journal as native
-packages. Source build dependencies still fail closed: they require a separate
-isolated build-root graph so build tools cannot be confused with packages
-published into the target root.
+packages. Build dependencies enter a separate bounded graph whose candidates
+must come from authenticated native indexes. Corinth materializes the selected
+dependency-first closure under a fresh private root and mounts it read-only at
+`/corinth-build` for the admitted source build. The sandbox receives bounded
+tool, compiler, linker, CMake, and pkg-config search paths rooted there. It does
+not receive the live target root. Every selected native artifact, provider,
+authority sequence, index digest, metadata digest, and source-lock digest is
+retained in the source receipt; the temporary root is removed after the build.
+An unresolved or source-only build dependency fails before target mutation.
 
 Arch and AUR locks parse static PKGBUILD metadata. Fedora, Debian, Alpine,
 Gentoo, and CRUX locks bind both their bounded packaging metadata and a source

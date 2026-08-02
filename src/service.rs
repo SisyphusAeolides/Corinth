@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,6 +56,7 @@ const MAX_PROVIDER_COUNT: usize = 256;
 const MAX_CATALOG_PACKAGES: usize = 100_000;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_VERSION_BYTES: usize = 256;
+const BUILD_DEPENDENCY_ROOT_PACKAGE: &str = "corinth-build-closure";
 static RESOURCE_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 pub const DEFAULT_SERVICE_CONFIG: &str = "/etc/corinth/service.toml";
@@ -173,6 +174,23 @@ pub struct ServiceReceipt {
     pub origin: ServiceOrigin,
 }
 
+/// Exact signed-native inputs materialized only for one source build.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceBuildDependency {
+    pub package: String,
+    pub version: String,
+    pub release: u32,
+    pub provider: String,
+    pub channel: String,
+    pub provider_generation: u64,
+    pub package_sequence: u64,
+    pub artifact_sha256: String,
+    pub index_sha256: String,
+    pub metadata_sha256: String,
+    pub source_lock_sha256: String,
+}
+
 impl ServiceReceipt {
     fn dependency_metadata(&self) -> crate::dependency::DependencyMetadata {
         crate::dependency::DependencyMetadata {
@@ -208,6 +226,8 @@ pub enum ServiceOrigin {
         recipe_sha256: String,
         source_lock_sha256: String,
         compiler_sha256: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        build_dependencies: Vec<ServiceBuildDependency>,
     },
 }
 
@@ -1292,6 +1312,165 @@ impl PackageService {
         Ok(PreparedCandidate { receipt, payload })
     }
 
+    fn extend_native_build_universe(
+        &self,
+        requirement: &PackageRequirement,
+        universe: &mut Vec<ResolvedPackage>,
+        candidate_indexes: &mut BTreeMap<String, usize>,
+    ) -> Result<(), ServiceError> {
+        for alternative in &requirement.alternatives {
+            if alternative.name == BUILD_DEPENDENCY_ROOT_PACKAGE {
+                return Err(ServiceError::Dependency(
+                    "build dependency uses Corinth's reserved closure identity".into(),
+                ));
+            }
+            let domain = match self.resolve_constraint_domain(alternative) {
+                Ok(domain) => domain,
+                Err(ServiceError::PackageNotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            for candidate in domain {
+                if !matches!(candidate, ResolvedPackage::Native(_))
+                    || !candidate_satisfies(&candidate.solver_candidate(), alternative)
+                {
+                    continue;
+                }
+                let key = candidate.graph_key();
+                if !candidate_indexes.contains_key(&key)
+                    && universe.len() >= crate::alchemist::MAX_PACKAGES - 1
+                {
+                    return Err(ServiceError::Dependency(format!(
+                        "build dependency closure exceeds {} native records",
+                        crate::alchemist::MAX_PACKAGES - 1
+                    )));
+                }
+                insert_graph_candidate(universe, candidate_indexes, candidate)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_native_build_dependencies(
+        &self,
+        dependencies: &[String],
+    ) -> Result<Vec<NativeCandidate>, ServiceError> {
+        let requirements = dependencies
+            .iter()
+            .cloned()
+            .map(crate::dependency::package_requirement)
+            .collect::<Vec<_>>();
+        validate_dependency_metadata(&requirements, &[], &[])?;
+
+        let mut universe = Vec::new();
+        let mut candidate_indexes = BTreeMap::new();
+        for requirement in &requirements {
+            self.extend_native_build_universe(requirement, &mut universe, &mut candidate_indexes)?;
+        }
+
+        let mut cursor = 0usize;
+        while cursor < universe.len() {
+            let metadata = universe[cursor].dependency_metadata();
+            for requirement in &metadata.requirements {
+                self.extend_native_build_universe(
+                    requirement,
+                    &mut universe,
+                    &mut candidate_indexes,
+                )?;
+            }
+            cursor += 1;
+        }
+
+        let mut solver_candidates = universe
+            .iter()
+            .map(ResolvedPackage::solver_candidate)
+            .collect::<Vec<_>>();
+        let root_index = solver_candidates.len();
+        solver_candidates.push(ResolutionCandidate {
+            package: BUILD_DEPENDENCY_ROOT_PACKAGE.into(),
+            version: "1".into(),
+            sequence: 1,
+            metadata: crate::dependency::DependencyMetadata {
+                requirements,
+                provides: Vec::new(),
+                conflicts: Vec::new(),
+            },
+        });
+        let plan = solve_dependency_graph(&solver_candidates, root_index, &[])?;
+        plan.order
+            .into_iter()
+            .filter(|candidate| *candidate != root_index)
+            .map(|candidate| match universe[candidate].clone() {
+                ResolvedPackage::Native(candidate) => Ok(*candidate),
+                ResolvedPackage::Source(_) => Err(ServiceError::Dependency(
+                    "source package entered the native build closure".into(),
+                )),
+            })
+            .collect()
+    }
+
+    fn prepare_build_dependency_root(
+        &self,
+        dependencies: &[String],
+    ) -> Result<Option<PreparedBuildRoot>, ServiceError> {
+        if dependencies.is_empty() {
+            return Ok(None);
+        }
+        let candidates = self.resolve_native_build_dependencies(dependencies)?;
+        let base = self.config.work.join("source-build-roots");
+        prepare_private_root(&base)?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ServiceError::State(error.to_string()))?
+            .as_nanos();
+        let serial = RESOURCE_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let operation_root = base.join(format!("{}-{nonce}-{serial}", std::process::id()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&operation_root)
+            .map_err(|error| ServiceError::State(error.to_string()))?;
+        let mut prepared = PreparedBuildRoot {
+            root: operation_root.join("root"),
+            operation_root,
+            dependencies: Vec::with_capacity(candidates.len()),
+            cleanup_required: true,
+        };
+        prepare_private_root(&prepared.root)?;
+        let state = prepared.operation_root.join("state");
+        prepare_private_root(&state)?;
+        let store = BinaryInstallStore::open(state, prepared.root.clone())?;
+
+        for candidate in candidates {
+            let native = self.prepare_native_candidate(candidate)?;
+            store.install_payload(&native.payload, &native.receipt.artifact_sha256, false)?;
+            let ServiceOrigin::Native {
+                index_sha256,
+                metadata_sha256,
+                source_lock_sha256,
+            } = &native.receipt.origin
+            else {
+                return Err(ServiceError::Dependency(
+                    "non-native receipt entered the native build closure".into(),
+                ));
+            };
+            prepared.dependencies.push(ServiceBuildDependency {
+                package: native.receipt.package,
+                version: native.receipt.version,
+                release: native.receipt.release,
+                provider: native.receipt.provider,
+                channel: native.receipt.channel,
+                provider_generation: native.receipt.provider_generation,
+                package_sequence: native.receipt.package_sequence,
+                artifact_sha256: native.receipt.artifact_sha256,
+                index_sha256: index_sha256.clone(),
+                metadata_sha256: metadata_sha256.clone(),
+                source_lock_sha256: source_lock_sha256.clone(),
+            });
+        }
+        prepared.dependencies.sort();
+        validate_service_build_dependencies(&prepared.dependencies)?;
+        Ok(Some(prepared))
+    }
+
     fn prepare_source_candidate(
         &self,
         candidate: SourceCandidate,
@@ -1375,17 +1554,21 @@ impl PackageService {
                 "translated recipe release differs from the signed source catalog".into(),
             ));
         }
-        if !recipe.build.depends.is_empty() {
-            return Err(ServiceError::Provider(
-                "source build dependencies require an isolated build-root transaction".into(),
-            ));
-        }
         validate_source_dependency_binding(package, recipe.runtime.as_ref())?;
+        let build_root = self.prepare_build_dependency_root(&recipe.build.depends)?;
         let compiler = host_compiler_target(&self.config.compiler)?;
         let compiler_sha256 = compiler_digest(&compiler)?;
-        let build = provisioner.build_admitted_system_recipe(&imported.recipe.bytes, &compiler)?;
+        let build = provisioner.build_admitted_system_recipe(
+            &imported.recipe.bytes,
+            &compiler,
+            build_root.as_ref().map(|root| root.root.as_path()),
+        )?;
         let payload =
             provisioner.payload_from_admitted_system_recipe(&imported.recipe.bytes, &build)?;
+        let build_dependencies = build_root
+            .map(PreparedBuildRoot::finish)
+            .transpose()?
+            .unwrap_or_default();
         let receipt = ServiceReceipt {
             format: SERVICE_RECEIPT_FORMAT,
             package: build.package,
@@ -1409,6 +1592,7 @@ impl PackageService {
                 recipe_sha256: package.recipe_sha256.clone(),
                 source_lock_sha256: package.source_lock_sha256.clone(),
                 compiler_sha256,
+                build_dependencies,
             },
         };
         validate_service_receipt(&receipt)?;
@@ -1731,6 +1915,30 @@ impl PackageService {
 struct PreparedCandidate {
     receipt: ServiceReceipt,
     payload: crate::binary::BinaryPayload,
+}
+
+struct PreparedBuildRoot {
+    operation_root: PathBuf,
+    root: PathBuf,
+    dependencies: Vec<ServiceBuildDependency>,
+    cleanup_required: bool,
+}
+
+impl PreparedBuildRoot {
+    fn finish(mut self) -> Result<Vec<ServiceBuildDependency>, ServiceError> {
+        fs::remove_dir_all(&self.operation_root)
+            .map_err(|error| ServiceError::State(error.to_string()))?;
+        self.cleanup_required = false;
+        Ok(std::mem::take(&mut self.dependencies))
+    }
+}
+
+impl Drop for PreparedBuildRoot {
+    fn drop(&mut self) {
+        if self.cleanup_required {
+            let _ = fs::remove_dir_all(&self.operation_root);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2320,6 +2528,42 @@ fn selector_matches_receipt(
     Ok(())
 }
 
+fn validate_service_build_dependencies(
+    dependencies: &[ServiceBuildDependency],
+) -> Result<(), ServiceError> {
+    if dependencies.len() >= crate::alchemist::MAX_PACKAGES
+        || dependencies.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ServiceError::State(
+            "invalid source build dependency closure".into(),
+        ));
+    }
+    let mut packages = BTreeSet::new();
+    for dependency in dependencies {
+        if !valid_package_name(&dependency.package)
+            || !packages.insert(&dependency.package)
+            || !valid_version(&dependency.version)
+            || dependency.release == 0
+            || !valid_name(&dependency.provider)
+            || !valid_name(&dependency.channel)
+            || dependency.provider_generation == 0
+            || ![
+                &dependency.artifact_sha256,
+                &dependency.index_sha256,
+                &dependency.metadata_sha256,
+                &dependency.source_lock_sha256,
+            ]
+            .into_iter()
+            .all(|digest| valid_digest(digest))
+        {
+            return Err(ServiceError::State(
+                "invalid source build dependency closure".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_service_receipt(receipt: &ServiceReceipt) -> Result<(), ServiceError> {
     if !matches!(
         receipt.format,
@@ -2372,9 +2616,12 @@ fn validate_service_receipt(receipt: &ServiceReceipt) -> Result<(), ServiceError
             recipe_sha256,
             source_lock_sha256,
             compiler_sha256,
+            build_dependencies,
             ..
         } => {
             if receipt.package_sequence == 0
+                || (receipt.format == LEGACY_SERVICE_RECEIPT_FORMAT
+                    && !build_dependencies.is_empty())
                 || ![
                     catalog_sha256,
                     ingress_lock_sha256,
@@ -2385,6 +2632,7 @@ fn validate_service_receipt(receipt: &ServiceReceipt) -> Result<(), ServiceError
                 ]
                 .into_iter()
                 .all(|digest| valid_digest(digest))
+                || validate_service_build_dependencies(build_dependencies).is_err()
             {
                 return Err(ServiceError::State("invalid source service receipt".into()));
             }
@@ -3148,7 +3396,7 @@ mod tests {
     }
 
     fn buildable_source_repository(roots: &TestRoots, signing: &SigningKey) -> SourceRepository {
-        buildable_source_repository_with_dependency(roots, signing, None)
+        buildable_source_repository_with_dependencies(roots, signing, None, None)
     }
 
     fn buildable_source_repository_with_dependency(
@@ -3156,13 +3404,24 @@ mod tests {
         signing: &SigningKey,
         dependency: Option<&str>,
     ) -> SourceRepository {
+        buildable_source_repository_with_dependencies(roots, signing, dependency, None)
+    }
+
+    fn buildable_source_repository_with_dependencies(
+        roots: &TestRoots,
+        signing: &SigningKey,
+        runtime_dependency: Option<&str>,
+        build_dependency: Option<&str>,
+    ) -> SourceRepository {
         let provider_repository = "https://aur.archlinux.org/demo.git";
         let provider_revision = "2".repeat(40);
         let source_repository = "https://example.org/demo.git";
         let source_revision = "1".repeat(40);
-        let depends = dependency.map_or_else(|| "()".into(), |name| format!("('{name}')"));
+        let depends = runtime_dependency.map_or_else(|| "()".into(), |name| format!("('{name}')"));
+        let makedepends =
+            build_dependency.map_or_else(|| "()".into(), |name| format!("('{name}')"));
         let pkgbuild = format!(
-            "pkgname=demo\npkgver=1.0.0\npkgrel=1\npkgdesc='demo service test'\narch=('x86_64')\nlicense=('MIT')\nsource=('git+{source_repository}#commit={source_revision}')\nsha256sums=('SKIP')\ndepends={depends}\nmakedepends=()\nprovides=()\nconflicts=()\n"
+            "pkgname=demo\npkgver=1.0.0\npkgrel=1\npkgdesc='demo service test'\narch=('x86_64')\nlicense=('MIT')\nsource=('git+{source_repository}#commit={source_revision}')\nsha256sums=('SKIP')\ndepends={depends}\nmakedepends={makedepends}\nprovides=()\nconflicts=()\n"
         );
         let upstream = roots.root.join("upstream-metadata");
         fs::create_dir(&upstream).unwrap();
@@ -3192,7 +3451,7 @@ mod tests {
             version: "1.0.0".into(),
             release: 1,
             sequence: 1,
-            requirements: dependency
+            requirements: runtime_dependency
                 .map(crate::dependency::package_requirement)
                 .into_iter()
                 .collect(),
@@ -3233,18 +3492,37 @@ mod tests {
             &provider_revision,
             &[("PKGBUILD", pkgbuild.as_bytes())],
         );
-        let cargo_manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n";
+        let cargo_manifest = if build_dependency.is_some() {
+            b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n".as_slice()
+        } else {
+            b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n".as_slice()
+        };
         let cargo_lock = b"# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 3\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\n";
-        cache_git_source(
-            roots,
-            source_repository,
-            &source_revision,
-            &[
-                ("Cargo.toml", cargo_manifest),
-                ("Cargo.lock", cargo_lock),
-                ("src/main.rs", b"fn main() { println!(\"demo\"); }\n"),
-            ],
-        );
+        let build_script = b"use std::process::Command;\nfn main() {\n    let output = Command::new(\"build-helper\").output().expect(\"build helper unavailable\");\n    assert!(output.status.success());\n    assert_eq!(output.stdout, b\"sealed-build-dependency\\n\");\n}\n";
+        if build_dependency.is_some() {
+            cache_git_source(
+                roots,
+                source_repository,
+                &source_revision,
+                &[
+                    ("Cargo.toml", cargo_manifest),
+                    ("Cargo.lock", cargo_lock),
+                    ("build.rs", build_script),
+                    ("src/main.rs", b"fn main() { println!(\"demo\"); }\n"),
+                ],
+            );
+        } else {
+            cache_git_source(
+                roots,
+                source_repository,
+                &source_revision,
+                &[
+                    ("Cargo.toml", cargo_manifest),
+                    ("Cargo.lock", cargo_lock),
+                    ("src/main.rs", b"fn main() { println!(\"demo\"); }\n"),
+                ],
+            );
+        }
         SourceRepository {
             name: "buildable-aur".into(),
             priority: 100,
@@ -4070,6 +4348,137 @@ mod tests {
         ));
         service.remove("demo").unwrap();
         service.remove("runtime-lib").unwrap();
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn source_build_uses_an_ephemeral_signed_native_dependency_closure() {
+        let signing = SigningKey::from_bytes(&[54_u8; 32]);
+        let roots = temporary_roots("source-build-dependencies", &signing);
+        let source = buildable_source_repository_with_dependencies(
+            &roots,
+            &signing,
+            None,
+            Some("build-helper"),
+        );
+        let mut helper = native_package(
+            "build-helper",
+            "1.0.0",
+            1,
+            b"#!/bin/sh\nexec helper-runtime\n",
+        );
+        helper.requirements = vec![crate::dependency::package_requirement("helper-runtime")];
+        let runtime = native_package(
+            "helper-runtime",
+            "1.0.0",
+            1,
+            b"#!/bin/sh\nprintf 'sealed-build-dependency\\n'\n",
+        );
+        let native = native_repository_packages(&roots, &signing, 1, vec![helper, runtime]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![native], vec![source]);
+        let service = open_service(&roots, &config, &signature);
+
+        let installed = service.install("demo").unwrap();
+        assert_eq!(installed.route, "source");
+        assert!(roots.target.join("usr/bin/demo").exists());
+        assert!(!roots.target.join("usr/bin/build-helper").exists());
+        assert!(!roots.target.join("usr/bin/helper-runtime").exists());
+        let receipt = service.read_service_receipt("demo").unwrap().unwrap();
+        let mut reordered = receipt.clone();
+        let ServiceOrigin::Source {
+            build_dependencies, ..
+        } = &mut reordered.origin
+        else {
+            panic!("source install must retain source provenance")
+        };
+        build_dependencies.reverse();
+        assert!(validate_service_receipt(&reordered).is_err());
+        let ServiceOrigin::Source {
+            build_dependencies, ..
+        } = receipt.origin
+        else {
+            panic!("source install must retain source provenance")
+        };
+        assert_eq!(build_dependencies.len(), 2);
+        assert_eq!(build_dependencies[0].package, "build-helper");
+        assert_eq!(build_dependencies[0].provider, "stable-native");
+        assert_eq!(build_dependencies[1].package, "helper-runtime");
+        let ephemeral = roots.work.join("source-build-roots");
+        assert!(ephemeral.is_dir());
+        assert_eq!(fs::read_dir(ephemeral).unwrap().count(), 0);
+
+        service.remove("demo").unwrap();
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn source_only_build_dependency_fails_before_target_mutation() {
+        let signing = SigningKey::from_bytes(&[55_u8; 32]);
+        let roots = temporary_roots("source-build-dependency-missing", &signing);
+        let source = buildable_source_repository_with_dependencies(
+            &roots,
+            &signing,
+            None,
+            Some("build-helper"),
+        );
+        let mut source_only = source_repository(&roots, &signing, "source-only-helper", 100, 'd');
+        let mut catalog: SourceCatalog =
+            toml::from_slice(&fs::read(&source_only.catalog).unwrap()).unwrap();
+        catalog.packages[0].name = "build-helper".into();
+        let catalog_bytes = toml::to_string(&catalog).unwrap().into_bytes();
+        let signed = write_signed(
+            &roots.root,
+            "source-only-helper-revised.toml",
+            &catalog_bytes,
+            &signing,
+        );
+        source_only.catalog = signed.path.to_string_lossy().into_owned();
+        source_only.catalog_sha256 = signed.sha256;
+        source_only.signature = signed.signature_path.to_string_lossy().into_owned();
+        source_only.signature_sha256 = signed.signature_sha256;
+        let (config, signature) =
+            write_config(&roots, &signing, 1, vec![], vec![source, source_only]);
+        let service = open_service(&roots, &config, &signature);
+
+        assert!(matches!(
+            service.install("demo"),
+            Err(ServiceError::Dependency(_))
+        ));
+        assert!(!roots.target.join("usr/bin/demo").exists());
+        assert!(service.read_all_service_receipts().unwrap().is_empty());
+        assert!(!service.graph_journal_path().exists());
+        fs::remove_dir_all(&roots.root).unwrap();
+    }
+
+    #[test]
+    fn failed_source_build_cleans_the_ephemeral_native_closure() {
+        let signing = SigningKey::from_bytes(&[56_u8; 32]);
+        let roots = temporary_roots("source-build-dependency-cleanup", &signing);
+        let source = buildable_source_repository_with_dependencies(
+            &roots,
+            &signing,
+            None,
+            Some("build-helper"),
+        );
+        let helper = native_package(
+            "build-helper",
+            "1.0.0",
+            1,
+            b"#!/bin/sh\nprintf 'unexpected-output\\n'\n",
+        );
+        let native = native_repository_packages(&roots, &signing, 1, vec![helper]);
+        let (config, signature) = write_config(&roots, &signing, 1, vec![native], vec![source]);
+        let service = open_service(&roots, &config, &signature);
+
+        assert!(matches!(
+            service.install("demo"),
+            Err(ServiceError::Hardware(_))
+        ));
+        assert!(!roots.target.join("usr/bin/demo").exists());
+        assert!(service.read_all_service_receipts().unwrap().is_empty());
+        let ephemeral = roots.work.join("source-build-roots");
+        assert!(ephemeral.is_dir());
+        assert_eq!(fs::read_dir(ephemeral).unwrap().count(), 0);
         fs::remove_dir_all(&roots.root).unwrap();
     }
 
