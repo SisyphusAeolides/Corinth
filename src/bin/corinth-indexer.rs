@@ -13,10 +13,10 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let (flags, allow_network) = parse_flags(std::env::args().skip(1).collect())?;
+    let (flags, _allow_network) = parse_flags(std::env::args().skip(1).collect())??;
     require_keys(&flags, &["keyring", "output"])?;
 
-    let keyring_path = required(&flags, "keyring")?;
+    let _keyring_path = required(let keyring_path = required(&flags, "keyring")flags, "keyring")??;
     let output_path = required(&flags, "output")?;
 
     // We construct a blank snapshot for demonstration.
@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
         });
     }
 
-    let mut snapshot = IndexSnapshot {
+    let snapshot = IndexSnapshot {
         format: INDEX_SNAPSHOT_FORMAT,
         sequence: 1,
         created_unix,
@@ -64,8 +64,8 @@ fn parse_flags(arguments: Vec<String>) -> Result<(BTreeMap<String, PathBuf>, boo
             index += 1;
             continue;
         }
-        let name = arguments[index].strip_prefix("--").ok_or_else(|| usage())?;
-        let value = arguments.get(index + 1).ok_or_else(|| usage())?;
+        let name = arguments[index].strip_prefix("--").ok_or_else(usage)?;
+        let value = arguments.get(index + 1).ok_or_else(usage)?;
         flags.insert(name.to_string(), PathBuf::from(value));
         index += 2;
     }
@@ -81,7 +81,7 @@ fn require_keys(flags: &BTreeMap<String, PathBuf>, expected: &[&str]) -> Result<
 }
 
 fn required<'a>(flags: &'a BTreeMap<String, PathBuf>, name: &str) -> Result<&'a Path, String> {
-    flags.get(name).map(PathBuf::as_path).ok_or_else(|| usage())
+    flags.get(name).map(PathBuf::as_path).ok_or_else(usage)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
