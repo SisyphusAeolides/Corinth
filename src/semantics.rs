@@ -9,6 +9,7 @@ use core::fmt;
 
 pub const PACKAGE_SEMANTICS_FORMAT: u32 = 1;
 pub const MAX_REPLACEMENTS: usize = 64;
+pub const MAX_CONFLICTS: usize = 64;
 pub const MAX_FEATURES: usize = 64;
 pub const MAX_OUTPUTS: usize = 64;
 pub const MAX_FILES: usize = 4096;
@@ -194,6 +195,7 @@ pub struct PackageSemantics {
     pub package: String,
     pub architecture: String,
     pub replacements: Vec<String>,
+    pub conflicts: Vec<String>,
     pub optional_features: Vec<OptionalFeature>,
     pub outputs: Vec<SplitOutput>,
     pub files: Vec<FileDeclaration>,
@@ -210,6 +212,7 @@ pub enum SemanticsError {
     Capacity,
     Duplicate,
     InvalidReplacement,
+    InvalidConflict,
     InvalidFeature,
     InvalidOutput,
     InvalidFile,
@@ -228,6 +231,7 @@ impl fmt::Display for SemanticsError {
             Self::Capacity => "package semantics exceed bounded capacity",
             Self::Duplicate => "package semantics contain a duplicate declaration",
             Self::InvalidReplacement => "invalid replacement declaration",
+            Self::InvalidConflict => "invalid conflict declaration",
             Self::InvalidFeature => "invalid optional feature declaration",
             Self::InvalidOutput => "invalid split output declaration",
             Self::InvalidFile => "invalid packaged file declaration",
@@ -251,6 +255,7 @@ impl PackageSemantics {
             return Err(SemanticsError::InvalidHeader);
         }
         if self.replacements.len() > MAX_REPLACEMENTS
+            || self.conflicts.len() > MAX_CONFLICTS
             || self.optional_features.len() > MAX_FEATURES
             || self.outputs.is_empty()
             || self.outputs.len() > MAX_OUTPUTS
@@ -265,6 +270,7 @@ impl PackageSemantics {
             return Err(SemanticsError::Capacity);
         }
         self.validate_replacements()?;
+        self.validate_conflicts()?;
         self.validate_features()?;
         let files = self.validate_files()?;
         self.validate_outputs(&files)?;
@@ -293,6 +299,19 @@ impl PackageSemantics {
                 || !replacements.insert(replacement.as_str())
             {
                 return Err(SemanticsError::InvalidReplacement);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_conflicts(&self) -> Result<(), SemanticsError> {
+        let mut conflicts = BTreeSet::new();
+        for conflict in &self.conflicts {
+            if conflict == &self.package
+                || !valid_name(conflict)
+                || !conflicts.insert(conflict.as_str())
+            {
+                return Err(SemanticsError::InvalidConflict);
             }
         }
         Ok(())
@@ -629,6 +648,7 @@ mod tests {
             package: "example".to_string(),
             architecture: "x86-64".to_string(),
             replacements: vec!["example-old".to_string()],
+            conflicts: vec![],
             optional_features: vec![OptionalFeature {
                 name: "tls".to_string(),
                 default_enabled: true,

@@ -585,4 +585,5 @@ use std::process;
 #[cfg(all(not(feature = "os-bin"), not(feature = "host-store")))]
 fn main() {
     eprintln!("corinth: build with --features host-store for the host transaction client");
+    std::process::exit(64);
 }

@@ -1,3 +1,5 @@
+#![cfg(feature = "host-store")]
+
 use std::process::Command;
 
 #[test]
