@@ -13,10 +13,10 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let (flags, _allow_network) = parse_flags(std::env::args().skip(1).collect())??;
+    let (flags, _allow_network) = parse_flags(std::env::args().skip(1).collect())?;
     require_keys(&flags, &["keyring", "output"])?;
 
-    let _keyring_path = required(let keyring_path = required(&flags, "keyring")flags, "keyring")??;
+    let _keyring_path = required(&flags, "keyring")?;
     let output_path = required(&flags, "output")?;
 
     // We construct a blank snapshot for demonstration.
