@@ -40,3 +40,5 @@ pub mod universal_discovery;
 #[cfg(feature = "host-store")]
 pub mod universal_import;
 pub mod worker;
+#[cfg(feature = "host-store")]
+pub mod executor;
