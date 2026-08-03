@@ -1,6 +1,12 @@
 //! Signed, sharded authority for the complete Arach recipe corpus.
 
-use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
+#[cfg(test)]
+use alloc::format;
+use alloc::{
+    collections::BTreeSet,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::fmt;
 use sha2::{Digest, Sha256};
 

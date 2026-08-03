@@ -309,9 +309,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
-fn parse_flags(
-    arguments: Vec<String>,
-) -> Result<(BTreeMap<String, PathBuf>, bool, Option<u16>), String> {
+type ParsedFlags = (BTreeMap<String, PathBuf>, bool, Option<u16>);
+
+fn parse_flags(arguments: Vec<String>) -> Result<ParsedFlags, String> {
     let mut flags = BTreeMap::new();
     let mut production = false;
     let mut selected_shard = None;

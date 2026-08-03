@@ -588,7 +588,7 @@ fn valid_acl_permissions(value: &str) -> bool {
     value.len() == 3
         && value
             .bytes()
-            .zip([b'r', b'w', b'x'])
+            .zip(*b"rwx")
             .all(|(actual, expected)| actual == expected || actual == b'-')
 }
 
