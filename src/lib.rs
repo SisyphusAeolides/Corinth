@@ -8,6 +8,7 @@ pub mod arch_import;
 #[cfg(feature = "host-store")]
 pub mod binary;
 pub mod command;
+pub mod corpus;
 pub mod crucible;
 #[cfg(feature = "host-store")]
 pub mod dependency;
