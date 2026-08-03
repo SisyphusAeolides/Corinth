@@ -25,6 +25,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/recipe-corpus.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -32,6 +33,7 @@ permissions:
 jobs:
   corpus-contract:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
