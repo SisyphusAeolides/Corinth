@@ -163,7 +163,7 @@ impl WorkerRequest {
             return Err(WorkerError::InvalidCapabilities);
         }
         let network_capability = capabilities.contains(&WorkerCapability::FixedOutputNetwork);
-        if network_capability != matches!(self.network, WorkerNetwork::FixedOutput { .. }) {
+        if network_capability != matches!(&self.network, WorkerNetwork::FixedOutput { .. }) {
             return Err(WorkerError::InvalidCapabilities);
         }
 
