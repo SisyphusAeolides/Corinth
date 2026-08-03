@@ -71,11 +71,23 @@ pub struct RouteSelection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "host-store", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "host-store", serde(deny_unknown_fields))]
+pub struct RuntimeRouteEvidence {
+    pub workload_class: String,
+    pub routing_decision: ApplicationRoute,
+    pub success: bool,
+    pub fallback_reason: Option<String>,
+    pub migration_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteError {
     InvalidPolicy,
     InvalidCandidate,
     DuplicateCandidate,
     Unsupported { workload: String },
+    InvalidEvidence,
 }
 
 impl fmt::Display for RouteError {
@@ -89,7 +101,40 @@ impl fmt::Display for RouteError {
             Self::Unsupported { workload } => {
                 write!(formatter, "no qualified execution route for {workload}")
             }
+            Self::InvalidEvidence => formatter.write_str("invalid runtime route evidence"),
         }
+    }
+}
+
+impl RuntimeRouteEvidence {
+    pub fn validate(&self) -> Result<(), RouteError> {
+        if !valid_identifier(&self.workload_class) {
+            return Err(RouteError::InvalidEvidence);
+        }
+        match self.routing_decision {
+            ApplicationRoute::Native => {
+                if self.fallback_reason.is_some() || self.migration_path.is_some() {
+                    return Err(RouteError::InvalidEvidence);
+                }
+            }
+            _ => {
+                if self
+                    .fallback_reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty() || reason.len() > 512)
+                {
+                    return Err(RouteError::InvalidEvidence);
+                }
+                if self
+                    .migration_path
+                    .as_deref()
+                    .is_none_or(|path| path.trim().is_empty() || path.len() > 512)
+                {
+                    return Err(RouteError::InvalidEvidence);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -350,5 +395,35 @@ mod tests {
                 workload: "office-suite".to_string()
             })
         );
+    }
+
+    fn evidence(route: ApplicationRoute) -> RuntimeRouteEvidence {
+        RuntimeRouteEvidence {
+            workload_class: "desktop-app".to_string(),
+            routing_decision: route,
+            success: true,
+            fallback_reason: (route != ApplicationRoute::Native)
+                .then(|| "native route is not yet qualified".to_string()),
+            migration_path: (route != ApplicationRoute::Native)
+                .then(|| "rebuild from source target Q3".to_string()),
+        }
+    }
+
+    #[test]
+    fn evidence_native_must_not_have_fallback_or_migration() {
+        let mut val = evidence(ApplicationRoute::Native);
+        val.fallback_reason = Some("reason".to_string());
+        assert_eq!(val.validate(), Err(RouteError::InvalidEvidence));
+    }
+
+    #[test]
+    fn evidence_fallback_must_have_reason_and_migration() {
+        let mut val = evidence(ApplicationRoute::ManagedVm);
+        val.fallback_reason = None;
+        assert_eq!(val.validate(), Err(RouteError::InvalidEvidence));
+
+        let mut val2 = evidence(ApplicationRoute::ManagedVm);
+        val2.migration_path = None;
+        assert_eq!(val2.validate(), Err(RouteError::InvalidEvidence));
     }
 }
