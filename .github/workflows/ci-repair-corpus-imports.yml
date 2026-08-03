@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - scripts/repair_corpus_imports.py
       - .github/workflows/ci-repair-corpus-imports.yml
 
 permissions:
@@ -12,7 +13,6 @@ permissions:
 jobs:
   repair:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -20,32 +20,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
-      - name: Repair no-std corpus imports
+      - name: Apply corpus import repair
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("src/corpus.rs")
-          text = path.read_text(encoding="utf-8")
-          old = "use alloc::{collections::BTreeSet, format, string::String, vec::Vec};\n"
-          new = "use alloc::{\n    collections::BTreeSet,\n    string::{String, ToString},\n    vec::Vec,\n};\n#[cfg(test)]\nuse alloc::format;\n"
-          if text.count(old) != 1:
-              raise SystemExit("corpus import line differs")
-          path.write_text(text.replace(old, new), encoding="utf-8")
-          PY
+          python3 scripts/repair_corpus_imports.py
           cargo fmt --all
-      - name: Validate repaired corpus imports
-        run: >-
-          cargo clippy --locked --all-targets --features fortran-policy,host-store --
-          -D warnings
-          -A clippy::new_without_default
-          -A clippy::manual_memcpy
-          -A clippy::needless_range_loop
-          -A clippy::unused_enumerate_index
-      - name: Commit repair
+          rm scripts/repair_corpus_imports.py
+          git diff --check
+      - name: Validate corpus imports
+        run: cargo clippy --locked --all-targets --features fortran-policy,host-store -- -D warnings -A clippy::new_without_default -A clippy::manual_memcpy -A clippy::needless_range_loop -A clippy::unused_enumerate_index
+      - name: Commit repaired imports
         run: |
           git config user.name 'SisyphusAeolides'
           git config user.email '37166405+SisyphusAeolides@users.noreply.github.com'
-          git add src/corpus.rs
+          git add src/corpus.rs scripts/repair_corpus_imports.py
           git commit -m 'fix: repair corpus no-std imports'
           git pull --rebase origin main
           git push origin HEAD:main
