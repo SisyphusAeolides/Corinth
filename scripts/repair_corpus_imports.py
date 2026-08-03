@@ -23,3 +23,17 @@ new = '.zip(*b"rwx")'
 if text.count(old) != 1:
     raise SystemExit("permission byte slice differs")
 path.write_text(text.replace(old, new), encoding="utf-8")
+
+path = Path("src/bin/corinth-corpus.rs")
+text = path.read_text(encoding="utf-8")
+old = '''fn parse_flags(
+    arguments: Vec<String>,
+) -> Result<(BTreeMap<String, PathBuf>, bool, Option<u16>), String> {
+'''
+new = '''type ParsedFlags = (BTreeMap<String, PathBuf>, bool, Option<u16>);
+
+fn parse_flags(arguments: Vec<String>) -> Result<ParsedFlags, String> {
+'''
+if text.count(old) != 1:
+    raise SystemExit("corpus flag signature differs")
+path.write_text(text.replace(old, new), encoding="utf-8")
