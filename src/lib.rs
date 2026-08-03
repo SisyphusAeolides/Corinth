@@ -28,10 +28,10 @@ pub mod registry;
 pub mod service;
 pub mod shell;
 pub mod source;
-#[cfg(feature = "host-store")]
 pub mod store;
 pub mod synthesizer;
 #[cfg(feature = "host-store")]
 pub mod universal_discovery;
 #[cfg(feature = "host-store")]
 pub mod universal_import;
+pub mod worker;
