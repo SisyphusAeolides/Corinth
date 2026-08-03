@@ -64,6 +64,11 @@ name = "corinth-corpus"
 path = "src/bin/corinth-corpus.rs"
 required-features = ["host-store"]
 
+[[bin]]
+name = "corinth-indexer"
+path = "src/bin/corinth-indexer.rs"
+required-features = ["host-store"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
