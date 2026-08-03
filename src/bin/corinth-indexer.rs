@@ -1,4 +1,4 @@
-use corinth::indexer::{ALL_UPSTREAMS, INDEX_SNAPSHOT_FORMAT, IndexSnapshot, UpstreamRoot};
+use corinth::indexer::IndexSnapshot;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -14,36 +14,22 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let (flags, _allow_network) = parse_flags(std::env::args().skip(1).collect())?;
-    require_keys(&flags, &["keyring", "output"])?;
+    require_keys(&flags, &["keyring", "input", "output"])?;
 
-    let _keyring_path = required(&flags, "keyring")?;
+    let keyring_path = required(&flags, "keyring")?;
+    let input_path = required(&flags, "input")?;
     let output_path = required(&flags, "output")?;
 
-    // We construct a blank snapshot for demonstration.
-    // In a real service this would process arguments, loop, and update.
-    let created_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-
-    let mut roots = Vec::new();
-    for upstream in ALL_UPSTREAMS {
-        roots.push(UpstreamRoot {
-            upstream,
-            revision: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            index_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-        });
+    if keyring_path.is_symlink() || !keyring_path.is_file() {
+        return Err("keyring is not a regular file".into());
     }
-
-    let snapshot = IndexSnapshot {
-        format: INDEX_SNAPSHOT_FORMAT,
-        sequence: 1,
-        created_unix,
-        key_id: "corinth-auto-indexer-1".into(),
-        signature_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-        upstream_roots: roots,
-        entries: Vec::new(),
-    };
+    if input_path.is_symlink() || !input_path.is_file() {
+        return Err("input snapshot is not a regular file".into());
+    }
+    let snapshot: IndexSnapshot =
+        serde_json::from_slice(&fs::read(input_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    snapshot.validate(None).map_err(|error| error.to_string())?;
 
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
     write_atomic(output_path, &bytes)?;
@@ -116,5 +102,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: corinth-indexer --keyring FILE --output FILE [--allow-network]".into()
+    "usage: corinth-indexer --keyring FILE --input SNAPSHOT.json --output FILE [--allow-network]"
+        .into()
 }
