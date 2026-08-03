@@ -15,6 +15,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/repository-indexers.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,6 +23,7 @@ permissions:
 jobs:
   snapshot-contract:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
