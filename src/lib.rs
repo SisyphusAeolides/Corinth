@@ -25,6 +25,7 @@ pub mod net;
 pub mod pkg;
 pub mod policy;
 pub mod registry;
+pub mod route;
 pub mod semantics;
 #[cfg(feature = "host-store")]
 pub mod service;
