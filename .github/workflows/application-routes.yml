@@ -1,0 +1,37 @@
+name: Application routes
+
+on:
+  push:
+    paths:
+      - src/route.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/application-routes.yml
+  pull_request:
+    paths:
+      - src/route.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/application-routes.yml
+
+permissions:
+  contents: read
+
+jobs:
+  route-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Test application route selection
+        run: cargo test --locked --lib route::tests
+      - name: Check serialized host-store routes
+        run: cargo check --locked --lib --features host-store
+      - name: Lint route policy
+        run: cargo clippy --locked --lib --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo fmt --all -- --check
