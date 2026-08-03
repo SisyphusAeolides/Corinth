@@ -4,9 +4,11 @@
 use alloc::format;
 use alloc::{
     collections::BTreeSet,
-    string::{String, ToString},
+    string::String,
     vec::Vec,
 };
+#[cfg(feature = "host-store")]
+use alloc::string::ToString;
 use core::fmt;
 use sha2::{Digest, Sha256};
 
