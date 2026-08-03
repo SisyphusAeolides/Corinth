@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 repository = "https://github.com/SisyphusAeolides/Corinth"
-description = "Transactional source and binary package manager for Arach OS"
+description = "Transactional source and binary package manager for ArachOS"
 build = "build.rs"
 
 [features]

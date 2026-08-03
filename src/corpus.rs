@@ -119,7 +119,7 @@ impl RecipeCorpusManifest {
         expected_count: usize,
     ) -> Result<(), RecipeCorpusError> {
         if self.format != RECIPE_CORPUS_FORMAT
-            || self.distribution != "Arach OS"
+            || self.distribution != "ArachOS"
             || !valid_architecture(&self.architecture)
             || self.shard_count == 0
             || !self.shard_count.is_power_of_two()
@@ -426,7 +426,7 @@ mod tests {
     fn manifest(entries: Vec<RecipeCorpusEntry>) -> RecipeCorpusManifest {
         RecipeCorpusManifest {
             format: RECIPE_CORPUS_FORMAT,
-            distribution: "Arach OS".to_string(),
+            distribution: "ArachOS".to_string(),
             target_count: entries.len() as u32,
             shard_count: 8,
             architecture: "x86-64".to_string(),

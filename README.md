@@ -1,6 +1,6 @@
 # Corinth
 
-Corinth is the transactional source and binary package manager for Arach OS.
+Corinth is the transactional source and binary package manager for ArachOS.
 It stages canonical package-state changes, validates locked source identities,
 measures artifacts, commits complete generations atomically, and retains a
 bounded rollback history.
@@ -16,13 +16,13 @@ host recipe executor, and generation store. Fortran provides build scheduling
 telemetry that cannot grant trust. Idris 2 makes source selection total, and
 Agda proves that raw build sources cannot acquire system-driver authority.
 
-## Current Arach OS integration
+## Current ArachOS integration
 
-The Arach OS component lock is the authority for the exact Corinth revision
+The ArachOS component lock is the authority for the exact Corinth revision
 used by a release.
 
 Arach-Packages validation fetches that exact revision and builds its declared
-native outputs rather than substituting a local checkout. Arach OS then
+native outputs rather than substituting a local checkout. ArachOS then
 materializes versioned Corinth artifacts into the signed live root and requires
 the package manager, package generation, and installer paths before publishing
 the SquashFS and UEFI ISO layout.
