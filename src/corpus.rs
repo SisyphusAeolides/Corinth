@@ -1,6 +1,6 @@
 //! Signed, sharded authority for the complete Arach recipe corpus.
 
-use alloc::{collections::BTreeSet, string::String, vec::Vec};
+use alloc::{collections::BTreeSet, format, string::String, vec::Vec};
 use core::fmt;
 use sha2::{Digest, Sha256};
 
@@ -42,6 +42,7 @@ pub struct RecipeCorpusEntry {
     pub recipe: String,
     pub receipt: String,
     pub worker_request: Option<String>,
+    pub worker_request_sha256: Option<String>,
     pub fallback_reason: Option<String>,
 }
 
@@ -206,7 +207,10 @@ impl RecipeCorpusManifest {
 
             match entry.strategy {
                 RecipeGenerationStrategy::StaticImporter => {
-                    if entry.worker_request.is_some() || entry.fallback_reason.is_some() {
+                    if entry.worker_request.is_some()
+                        || entry.worker_request_sha256.is_some()
+                        || entry.fallback_reason.is_some()
+                    {
                         return Err(RecipeCorpusError::InvalidStrategy);
                     }
                 }
@@ -218,6 +222,13 @@ impl RecipeCorpusManifest {
                     validate_path(request, "workers/", ".json")?;
                     if !worker_requests.insert(request) {
                         return Err(RecipeCorpusError::Duplicate);
+                    }
+                    if !entry
+                        .worker_request_sha256
+                        .as_deref()
+                        .is_some_and(valid_digest)
+                    {
+                        return Err(RecipeCorpusError::InvalidDigest);
                     }
                     if entry
                         .fallback_reason
@@ -404,6 +415,9 @@ mod tests {
             receipt: format!("receipts/{package}.toml"),
             worker_request: (strategy == RecipeGenerationStrategy::DeterministicWorker)
                 .then(|| format!("workers/{package}.json")),
+            worker_request_sha256: (strategy
+                == RecipeGenerationStrategy::DeterministicWorker)
+                .then(|| digest('e')),
             fallback_reason: (strategy == RecipeGenerationStrategy::DeterministicWorker)
                 .then(|| "static metadata contains dynamic packaging logic".to_string()),
         }
@@ -476,6 +490,20 @@ mod tests {
         assert_eq!(
             value.validate_with_expected_count(1),
             Err(RecipeCorpusError::InvalidStrategy)
+        );
+    }
+
+    #[test]
+    fn worker_request_requires_a_digest() {
+        let mut value = manifest(vec![entry(
+            0,
+            "alpha",
+            RecipeGenerationStrategy::DeterministicWorker,
+        )]);
+        value.entries[0].worker_request_sha256 = None;
+        assert_eq!(
+            value.validate_with_expected_count(1),
+            Err(RecipeCorpusError::InvalidDigest)
         );
     }
 
