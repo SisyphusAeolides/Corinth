@@ -18,7 +18,7 @@ host-store = ["dep:libc", "dep:arach-hwd", "dep:serde", "dep:serde_json", "dep:t
 sha2 = { version = "0.10.9", default-features = false }
 slope = { git = "https://github.com/SisyphusAeolides/Slope.git", rev = "0982b44f3d7271903f827b4169cbf69b332a69ef" }
 libc = { version = "=0.2.189", optional = true }
-arach-hwd = { git = "https://github.com/SisyphusAeolides/Arach-HWD.git", rev = "8a02fa4a41d5e21b447a92414db23b4b706f3731", optional = true }
+arach-hwd = { git = "https://github.com/SisyphusAeolides/Arach-HWD.git", rev = "a04ed76bd291612efbae807a9b709364874da498", optional = true }
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 toml = { version = "=0.9.12", optional = true }
@@ -57,6 +57,11 @@ required-features = ["host-store"]
 [[bin]]
 name = "corinth-discover"
 path = "src/bin/corinth-discover.rs"
+required-features = ["host-store"]
+
+[[bin]]
+name = "corinth-corpus"
+path = "src/bin/corinth-corpus.rs"
 required-features = ["host-store"]
 
 [lints.rust]
