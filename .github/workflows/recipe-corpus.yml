@@ -1,0 +1,51 @@
+name: Recipe corpus
+
+on:
+  push:
+    paths:
+      - src/corpus.rs
+      - src/bin/corinth-corpus.rs
+      - src/indexer.rs
+      - src/worker.rs
+      - src/universal_import.rs
+      - src/arch_import.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/recipe-corpus.yml
+  pull_request:
+    paths:
+      - src/corpus.rs
+      - src/bin/corinth-corpus.rs
+      - src/indexer.rs
+      - src/worker.rs
+      - src/universal_import.rs
+      - src/arch_import.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/recipe-corpus.yml
+
+permissions:
+  contents: read
+
+jobs:
+  corpus-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Check no-std corpus contract
+        run: cargo check --locked --lib --no-default-features
+      - name: Test deterministic corpus sharding
+        run: cargo test --locked --lib corpus::tests
+      - name: Test signed corpus verifier
+        run: cargo test --locked --features host-store --bin corinth-corpus
+      - name: Check host-store corpus binary
+        run: cargo check --locked --features host-store --bin corinth-corpus
+      - name: Lint corpus paths
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo fmt --all -- --check
