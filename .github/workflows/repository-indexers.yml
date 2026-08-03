@@ -1,0 +1,37 @@
+name: Repository indexers
+
+on:
+  push:
+    paths:
+      - src/indexer.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/repository-indexers.yml
+  pull_request:
+    paths:
+      - src/indexer.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/repository-indexers.yml
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Test immutable upstream snapshots
+        run: cargo test --locked --lib indexer::tests
+      - name: Check serialized host-store snapshot
+        run: cargo check --locked --lib --features host-store
+      - name: Lint indexer contract
+        run: cargo clippy --locked --lib --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo fmt --all -- --check
