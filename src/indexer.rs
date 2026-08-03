@@ -40,7 +40,10 @@ pub const ALL_UPSTREAMS: [Upstream; UPSTREAM_COUNT] = [
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "host-store", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "host-store", serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields))]
+#[cfg_attr(
+    feature = "host-store",
+    serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)
+)]
 pub enum SourcePin {
     Git {
         repository: String,
@@ -165,7 +168,11 @@ impl IndexSnapshot {
 
         let mut previous_key: Option<(Upstream, &str, &str)> = None;
         for entry in &self.entries {
-            let key = (entry.upstream, entry.package.as_str(), entry.version.as_str());
+            let key = (
+                entry.upstream,
+                entry.package.as_str(),
+                entry.version.as_str(),
+            );
             if previous_key.is_some_and(|previous| previous >= key) {
                 return Err(IndexError::NonCanonicalOrder);
             }
@@ -280,15 +287,17 @@ fn valid_identifier(value: &str) -> bool {
 fn valid_package(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_PACKAGE_NAME_BYTES
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_' | b'.')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_' | b'.'))
 }
 
 fn valid_version(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_VERSION_BYTES
-        && !value.bytes().any(|byte| byte.is_ascii_whitespace() || byte == 0)
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == 0)
 }
 
 fn valid_revision(value: &str) -> bool {
@@ -383,7 +392,10 @@ mod tests {
 
     #[test]
     fn rejects_non_monotonic_sequence() {
-        assert_eq!(snapshot().validate(Some(2)), Err(IndexError::InvalidSequence));
+        assert_eq!(
+            snapshot().validate(Some(2)),
+            Err(IndexError::InvalidSequence)
+        );
     }
 
     #[test]
@@ -420,9 +432,6 @@ mod tests {
             active_entry(Upstream::Debian, "zlib"),
             active_entry(Upstream::Arch, "base"),
         ];
-        assert_eq!(
-            value.validate(Some(1)),
-            Err(IndexError::NonCanonicalOrder)
-        );
+        assert_eq!(value.validate(Some(1)), Err(IndexError::NonCanonicalOrder));
     }
 }

@@ -83,7 +83,9 @@ impl fmt::Display for RouteError {
         match self {
             Self::InvalidPolicy => formatter.write_str("invalid workload route policy"),
             Self::InvalidCandidate => formatter.write_str("invalid application route candidate"),
-            Self::DuplicateCandidate => formatter.write_str("duplicate application route candidate"),
+            Self::DuplicateCandidate => {
+                formatter.write_str("duplicate application route candidate")
+            }
             Self::Unsupported { workload } => {
                 write!(formatter, "no qualified execution route for {workload}")
             }
@@ -108,7 +110,10 @@ pub fn select_route(
         if !policy.permitted_routes.contains(&preferred) {
             continue;
         }
-        let Some(candidate) = candidates.iter().find(|candidate| candidate.route == preferred) else {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.route == preferred)
+        else {
             continue;
         };
         if !candidate.available || !candidate.qualified {
@@ -175,8 +180,7 @@ impl RouteCandidate {
     pub fn validate(&self) -> Result<(), RouteError> {
         if !valid_identifier(&self.provider)
             || self.capabilities.len() > MAX_ROUTE_CAPABILITIES
-            || self.available != self.evidence_sha256.is_some()
-                && self.qualified
+            || self.available != self.evidence_sha256.is_some() && self.qualified
             || self
                 .evidence_sha256
                 .as_deref()

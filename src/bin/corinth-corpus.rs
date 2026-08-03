@@ -41,7 +41,13 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
     let (flags, production, selected_shard) = parse_flags(arguments)?;
     require_exact(
         &flags,
-        &["manifest", "manifest-signature", "keyring", "root", "report"],
+        &[
+            "manifest",
+            "manifest-signature",
+            "keyring",
+            "root",
+            "report",
+        ],
     )?;
 
     let manifest_path = required(&flags, "manifest")?;
@@ -223,20 +229,32 @@ const fn upstream_name(upstream: Upstream) -> &'static str {
     }
 }
 
-fn verify_relative(root: &Path, relative: &str, expected: &str, limit: u64) -> Result<Vec<u8>, String> {
+fn verify_relative(
+    root: &Path,
+    relative: &str,
+    expected: &str,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
     let path = root.join(relative);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
         return Err(format!("{} is not a bounded regular file", path.display()));
     }
     let canonical = fs::canonicalize(&path).map_err(|error| error.to_string())?;
     if canonical != path || !canonical.starts_with(root) {
-        return Err(format!("{} traverses a symlink or escapes the corpus root", relative));
+        return Err(format!(
+            "{} traverses a symlink or escapes the corpus root",
+            relative
+        ));
     }
     let bytes = fs::read(&canonical).map_err(|error| error.to_string())?;
     let actual = hex_digest(&Sha256::digest(&bytes));
     if actual != expected {
-        return Err(format!("{} digest differs from the signed corpus", relative));
+        return Err(format!(
+            "{} digest differs from the signed corpus",
+            relative
+        ));
     }
     Ok(bytes)
 }
@@ -249,7 +267,8 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
         return Err(format!("{} is not a bounded regular file", path.display()));
     }
@@ -260,11 +279,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if path.is_symlink() || path.exists() {
         return Err("report path must be a new non-symlink path".into());
     }
-    let parent = path.parent().ok_or_else(|| "report has no parent".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "report has no parent".to_string())?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("corpus"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("corpus"),
         std::process::id()
     ));
     let result = (|| {
@@ -316,7 +339,9 @@ fn parse_flags(
                 if !matches!(
                     name,
                     "manifest" | "manifest-signature" | "keyring" | "root" | "report"
-                ) || flags.insert(name.to_string(), PathBuf::from(value)).is_some()
+                ) || flags
+                    .insert(name.to_string(), PathBuf::from(value))
+                    .is_some()
                 {
                     return Err(usage());
                 }

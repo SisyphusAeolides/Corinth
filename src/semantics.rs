@@ -382,7 +382,8 @@ impl PackageSemantics {
         }
         for file in &self.files {
             if file.kind == FileKind::Hardlink {
-                let Some(target) = file.target.as_deref().and_then(|target| files.get(target)) else {
+                let Some(target) = file.target.as_deref().and_then(|target| files.get(target))
+                else {
                     return Err(SemanticsError::UnsafeLink);
                 };
                 if target.kind != FileKind::Regular {
@@ -497,9 +498,9 @@ impl PackageSemantics {
                 || files
                     .get(desktop)
                     .is_none_or(|file| file.kind != FileKind::Regular)
-                || files.get(executable).is_none_or(|file| {
-                    file.kind != FileKind::Regular || file.mode & 0o111 == 0
-                })
+                || files
+                    .get(executable)
+                    .is_none_or(|file| file.kind != FileKind::Regular || file.mode & 0o111 == 0)
             {
                 return Err(SemanticsError::InvalidDesktopRegistration);
             }
@@ -535,9 +536,9 @@ impl PackageSemantics {
 fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_' | b'.')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_' | b'.'))
 }
 
 fn valid_account(value: &str) -> bool {
@@ -579,12 +580,8 @@ fn valid_xattr(value: &str) -> bool {
 
 fn valid_acl_principal(value: &str) -> bool {
     matches!(value, "user" | "group" | "mask" | "other")
-        || value
-            .strip_prefix("user:")
-            .is_some_and(valid_account)
-        || value
-            .strip_prefix("group:")
-            .is_some_and(valid_account)
+        || value.strip_prefix("user:").is_some_and(valid_account)
+        || value.strip_prefix("group:").is_some_and(valid_account)
 }
 
 fn valid_acl_permissions(value: &str) -> bool {

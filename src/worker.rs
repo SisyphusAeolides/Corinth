@@ -65,7 +65,9 @@ pub struct FixedNetworkResource {
 )]
 pub enum WorkerNetwork {
     Denied,
-    FixedOutput { resources: Vec<FixedNetworkResource> },
+    FixedOutput {
+        resources: Vec<FixedNetworkResource>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,14 +374,18 @@ mod tests {
     #[test]
     fn denies_undeclared_network_access() {
         let mut value = request();
-        value.capabilities.push(WorkerCapability::FixedOutputNetwork);
+        value
+            .capabilities
+            .push(WorkerCapability::FixedOutputNetwork);
         assert_eq!(value.validate(), Err(WorkerError::InvalidCapabilities));
     }
 
     #[test]
     fn accepts_digest_bound_fixed_output_network() {
         let mut value = request();
-        value.capabilities.push(WorkerCapability::FixedOutputNetwork);
+        value
+            .capabilities
+            .push(WorkerCapability::FixedOutputNetwork);
         value.network = WorkerNetwork::FixedOutput {
             resources: vec![FixedNetworkResource {
                 url: "https://example.invalid/source.tar.xz".to_string(),
@@ -407,10 +413,7 @@ mod tests {
             request_sha256: digest('9'),
             runs: vec![first, second],
         };
-        assert_eq!(
-            evidence.validate(&value),
-            Err(WorkerError::NonReproducible)
-        );
+        assert_eq!(evidence.validate(&value), Err(WorkerError::NonReproducible));
     }
 
     #[test]

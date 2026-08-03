@@ -260,10 +260,7 @@ impl RecipeCorpusBuildReceipt {
         if self.generated == self.target_count {
             if self.worker_required != 0
                 || self.blocked != 0
-                || !self
-                    .recipe_merkle_root
-                    .as_deref()
-                    .is_some_and(valid_digest)
+                || !self.recipe_merkle_root.as_deref().is_some_and(valid_digest)
             {
                 return Err(RecipeCorpusError::InvalidReceipt);
             }
@@ -415,8 +412,7 @@ mod tests {
             receipt: format!("receipts/{package}.toml"),
             worker_request: (strategy == RecipeGenerationStrategy::DeterministicWorker)
                 .then(|| format!("workers/{package}.json")),
-            worker_request_sha256: (strategy
-                == RecipeGenerationStrategy::DeterministicWorker)
+            worker_request_sha256: (strategy == RecipeGenerationStrategy::DeterministicWorker)
                 .then(|| digest('e')),
             fallback_reason: (strategy == RecipeGenerationStrategy::DeterministicWorker)
                 .then(|| "static metadata contains dynamic packaging logic".to_string()),
@@ -450,7 +446,10 @@ mod tests {
             "alpha",
             RecipeGenerationStrategy::StaticImporter,
         )]);
-        assert_eq!(value.validate_production(), Err(RecipeCorpusError::InvalidCount));
+        assert_eq!(
+            value.validate_production(),
+            Err(RecipeCorpusError::InvalidCount)
+        );
     }
 
     #[test]
