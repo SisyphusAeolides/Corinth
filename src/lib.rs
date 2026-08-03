@@ -14,6 +14,8 @@ pub mod crucible;
 pub mod dependency;
 pub mod dna;
 #[cfg(feature = "host-store")]
+pub mod executor;
+#[cfg(feature = "host-store")]
 pub mod foreign_import;
 pub mod generation;
 #[cfg(feature = "host-store")]
@@ -40,5 +42,3 @@ pub mod universal_discovery;
 #[cfg(feature = "host-store")]
 pub mod universal_import;
 pub mod worker;
-#[cfg(feature = "host-store")]
-pub mod executor;

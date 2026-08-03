@@ -1,6 +1,4 @@
-use corinth::indexer::{
-    IndexSnapshot, UpstreamRoot, ALL_UPSTREAMS, INDEX_SNAPSHOT_FORMAT,
-};
+use corinth::indexer::{ALL_UPSTREAMS, INDEX_SNAPSHOT_FORMAT, IndexSnapshot, UpstreamRoot};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -20,7 +18,7 @@ fn run() -> Result<(), String> {
 
     let keyring_path = required(&flags, "keyring")?;
     let output_path = required(&flags, "output")?;
-    
+
     // We construct a blank snapshot for demonstration.
     // In a real service this would process arguments, loop, and update.
     let created_unix = std::time::SystemTime::now()
@@ -49,7 +47,10 @@ fn run() -> Result<(), String> {
 
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
     write_atomic(output_path, &bytes)?;
-    println!("wrote indexer snapshot format={} sequence={}", snapshot.format, snapshot.sequence);
+    println!(
+        "wrote indexer snapshot format={} sequence={}",
+        snapshot.format, snapshot.sequence
+    );
     Ok(())
 }
 

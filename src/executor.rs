@@ -1,13 +1,13 @@
 #[cfg(feature = "host-store")]
 use alloc::{format, string::String, vec::Vec};
 #[cfg(feature = "host-store")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "host-store")]
 use std::fs;
 #[cfg(feature = "host-store")]
 use std::path::Path;
 #[cfg(feature = "host-store")]
 use std::process::{Command, Stdio};
-#[cfg(feature = "host-store")]
-use sha2::{Digest, Sha256};
 
 #[cfg(feature = "host-store")]
 use crate::worker::{
@@ -27,7 +27,10 @@ fn hex_digest(data: &[u8]) -> String {
 }
 
 #[cfg(feature = "host-store")]
-pub fn execute(request: &WorkerRequest, work_dir: &Path) -> Result<ReproducibilityEvidence, WorkerError> {
+pub fn execute(
+    request: &WorkerRequest,
+    work_dir: &Path,
+) -> Result<ReproducibilityEvidence, WorkerError> {
     request.validate()?;
 
     let request_json = serde_json::to_string(request).map_err(|_| WorkerError::InvalidInput)?;
@@ -53,16 +56,31 @@ fn run_once(request: &WorkerRequest, work_dir: &Path) -> Result<WorkerRunEvidenc
     let mut cmd = Command::new("bwrap");
 
     cmd.arg("--unshare-all")
-       .arg("--die-with-parent")
-       .arg("--dir").arg("/work")
-       .arg("--chdir").arg("/work")
-       .arg("--ro-bind").arg("/usr").arg("/usr")
-       .arg("--symlink").arg("usr/lib").arg("/lib")
-       .arg("--symlink").arg("usr/lib64").arg("/lib64")
-       .arg("--symlink").arg("usr/bin").arg("/bin")
-       .arg("--symlink").arg("usr/sbin").arg("/sbin");
+        .arg("--die-with-parent")
+        .arg("--dir")
+        .arg("/work")
+        .arg("--chdir")
+        .arg("/work")
+        .arg("--ro-bind")
+        .arg("/usr")
+        .arg("/usr")
+        .arg("--symlink")
+        .arg("usr/lib")
+        .arg("/lib")
+        .arg("--symlink")
+        .arg("usr/lib64")
+        .arg("/lib64")
+        .arg("--symlink")
+        .arg("usr/bin")
+        .arg("/bin")
+        .arg("--symlink")
+        .arg("usr/sbin")
+        .arg("/sbin");
 
-    if request.capabilities.contains(&WorkerCapability::FixedOutputNetwork) {
+    if request
+        .capabilities
+        .contains(&WorkerCapability::FixedOutputNetwork)
+    {
         if let WorkerNetwork::FixedOutput { .. } = &request.network {
             cmd.arg("--share-net"); // Note: in reality bwrap would need more setup for network fetching.
         }
@@ -72,15 +90,22 @@ fn run_once(request: &WorkerRequest, work_dir: &Path) -> Result<WorkerRunEvidenc
     if request.capabilities.contains(&WorkerCapability::ReadInputs) {
         for input in &request.inputs {
             let host_path = work_dir.join(&input.path);
-            cmd.arg("--ro-bind").arg(host_path).arg(format!("/work/{}", input.path));
+            cmd.arg("--ro-bind")
+                .arg(host_path)
+                .arg(format!("/work/{}", input.path));
         }
     }
 
     // Bind tools
-    if request.capabilities.contains(&WorkerCapability::ExecuteTools) {
+    if request
+        .capabilities
+        .contains(&WorkerCapability::ExecuteTools)
+    {
         for tool in &request.tools {
             let host_path = work_dir.join(&tool.path);
-            cmd.arg("--ro-bind").arg(host_path).arg(format!("/work/{}", tool.path));
+            cmd.arg("--ro-bind")
+                .arg(host_path)
+                .arg(format!("/work/{}", tool.path));
         }
     }
 
@@ -99,7 +124,10 @@ fn run_once(request: &WorkerRequest, work_dir: &Path) -> Result<WorkerRunEvidenc
     let measurement_sha256 = hex_digest(&[]); // Empty measurement for now, could be telemetry
 
     let mut outputs_evidence = Vec::new();
-    if request.capabilities.contains(&WorkerCapability::WriteOutputs) {
+    if request
+        .capabilities
+        .contains(&WorkerCapability::WriteOutputs)
+    {
         for expected_out in &request.outputs {
             let host_path = work_dir.join(&expected_out.path);
             if let Ok(meta) = fs::metadata(&host_path) {
