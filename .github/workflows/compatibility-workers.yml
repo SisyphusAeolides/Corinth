@@ -1,0 +1,39 @@
+name: Compatibility workers
+
+on:
+  push:
+    paths:
+      - src/worker.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/compatibility-workers.yml
+  pull_request:
+    paths:
+      - src/worker.rs
+      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/compatibility-workers.yml
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - name: Check no-default-feature contract
+        run: cargo check --locked --lib --no-default-features
+      - name: Test worker contract
+        run: cargo test --locked --lib worker::tests
+      - name: Check serialized host-store contract
+        run: cargo check --locked --lib --features host-store
+      - name: Lint worker contract
+        run: cargo clippy --locked --lib --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo fmt --all -- --check
