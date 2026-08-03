@@ -18,6 +18,7 @@ pub mod generation;
 #[cfg(feature = "host-store")]
 pub mod hardware;
 pub mod helix;
+pub mod indexer;
 pub mod integrator;
 pub mod mycelium;
 pub mod net;
